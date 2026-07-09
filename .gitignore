@@ -1,0 +1,47 @@
+# Python env — not the knowledge
+.venv/
+__pycache__/
+*.pyc
+
+# Never commit secrets
+key.txt
+*.key
+.env
+
+# macOS
+.DS_Store
+
+# Large generated audio (keep the checked-in samples under experiments/*/assets)
+/tmp/
+
+# tutor toy diagnostic artifacts (logs + wavs)
+proto/diagnostics/
+
+# webapp diagnostic artifacts (logs + wavs)
+webapp/diagnostics/
+
+# backend-AEC experiment: compiled helper + probe/toy artifacts
+experiments/09-backend-aec/aec_helper
+experiments/09-backend-aec/diagnostics/
+
+# webapp Swift helper binaries (auto-built from *.swift at server boot)
+webapp/aec_helper
+webapp/kbd_legends
+
+# generated pronunciation clip cache
+webapp/clips/
+
+# teacher-owned per-student workspace
+webapp/workspace/
+
+# webapp: when a browser last connected (auto-open gating)
+webapp/.last_browser
+
+# Not shipped publicly — internal research corpus, experiment probes, roadmap, prototype
+research/
+experiments/
+proto/
+ROADMAP.md
+
+# Swift helper binary auto-built from wincap.swift at boot (like aec_helper / kbd_legends)
+webapp/wincap

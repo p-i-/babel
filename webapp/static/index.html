@@ -1,0 +1,793 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>babel</title>
+<style>
+  :root { --bg:#111; --panel:#1a1a1e; --fg:#e8e8ea; --dim:#9a9aa2; --acc:#7c9cff; }
+  * { box-sizing: border-box; }
+  body { margin:0; height:100vh; display:flex; background:var(--bg); color:var(--fg);
+         font:15px/1.45 -apple-system, "SF Pro Text", Helvetica, sans-serif; }
+  #rail { width:340px; min-width:280px; display:flex; flex-direction:column;
+          border-right:1px solid #2a2a30; background:var(--panel); }
+  #rail header { padding:10px 14px; border-bottom:1px solid #2a2a30;
+                 display:flex; align-items:center; gap:8px; }
+  #rail header h1 { margin:0; font-size:18px; letter-spacing:.5px; }
+  #strip { display:flex; gap:8px; margin-left:auto; font-size:17px; cursor:default; }
+  #strip span { opacity:.9; }
+  #strip .pulse { animation: pulse 1.2s infinite; }
+  @keyframes pulse { 50% { opacity:.3; } }
+  #mode { font-size:11px; color:var(--dim); padding:2px 14px 6px;
+          border-bottom:1px solid #2a2a30; }
+  #feed { flex:1; overflow-y:auto; padding:12px 14px; }
+  .line { margin:0 0 10px; white-space:pre-wrap; }
+  .line .who { font-size:11px; color:var(--dim); display:block; }
+  .line.you .who::before   { content:"🧬 you"; }
+  .line.tutor .who::before { content:"🤖 tutor"; }
+  .line.partial { opacity:.55; font-style:italic; }
+  .line.notice { color:var(--dim); font-size:12px; font-style:italic; }
+  .line.warn  { background:#2e2a1a; border-left:3px solid #e6c05a; border-radius:6px;
+                padding:6px 8px; font-size:12.5px; }
+  .line.error { background:#2e1a1a; border-left:3px solid #e05a5a; border-radius:6px;
+                padding:6px 8px; font-size:12.5px; }
+  #stripwrap { position:relative; border-top:1px solid #2a2a30; background:#0d0d11; }
+  #stripcv { display:block; width:100%; height:64px; }
+  #legendBtn { position:absolute; left:4px; top:4px; z-index:2; width:18px; height:18px;
+               border-radius:9px; border:1px solid #2e2e36; background:#1a1a1e;
+               color:#6d6d7a; font-size:11px; line-height:1; cursor:pointer; padding:0; }
+  #legendBtn:hover { color:var(--fg); }
+  #legend { display:none; position:absolute; left:6px; bottom:70px; z-index:3;
+            background:#1a1a1e; border:1px solid #2e2e36; border-radius:10px;
+            padding:10px 14px; font-size:11.5px; line-height:1.7; color:var(--dim);
+            box-shadow:0 6px 24px rgba(0,0,0,.5); white-space:nowrap; }
+  #legend b { color:var(--fg); font-weight:600; }
+  #legend .sw { display:inline-block; width:10px; height:10px; border-radius:2px;
+                margin-right:6px; vertical-align:-1px; }
+  #controls { display:flex; gap:8px; padding:10px 12px; border-top:1px solid #2a2a30; }
+  #controls button { flex:1; padding:10px 6px; font-size:18px; border-radius:10px;
+                     border:none; background:#2b2b33; color:var(--fg); cursor:pointer; }
+  #controls button.off { background:#3a2626; }
+  #controls button:hover { background:#34343e; }
+  #ptt { display:none; padding:0 12px 12px; }
+  #pttBtn { width:100%; padding:14px; font-size:16px; border-radius:10px; border:none;
+            background:#2b2b33; color:var(--fg); cursor:pointer; user-select:none;
+            -webkit-user-select:none; }
+  #pttBtn.live { background:#b33; }
+  #stale { position:fixed; inset:0; z-index:99; display:none; cursor:pointer;
+           background:rgba(10,10,14,.93); color:var(--fg);
+           flex-direction:column; align-items:center; justify-content:center;
+           gap:14px; text-align:center; padding:24px; }
+  #stale h2 { margin:0; font-size:22px; }
+  #stale p { margin:0; color:var(--dim); font-size:14px; }
+  #stage { flex:1; display:flex; flex-direction:column; }
+  #stage iframe { width:100%; flex:1; border:none; background:var(--bg); }
+  #kbd { border-top:1px solid #2a2a30; background:var(--panel);
+         padding:8px 12px 12px; user-select:none; -webkit-user-select:none; }
+  #kbdline { display:flex; gap:8px; margin-bottom:4px; }
+  #kbdbuf { flex:1; background:#111; border:1px solid #2e2e36; border-radius:8px;
+            padding:5px 12px; font-size:20px; min-height:34px; line-height:24px; }
+  #kbdbuf .hint { color:#55555e; font-size:13px; }
+  #kbdSend { width:52px; border-radius:8px; border:none; background:#2b2b33;
+             color:var(--fg); font-size:18px; cursor:pointer; }
+  #kbdSend:hover { background:#34343e; }
+  #kbdrows { width:max-content; margin:0 auto; }
+  .krow { display:flex; gap:6px; justify-content:flex-start; margin-top:6px; }
+  .key { position:relative; width:46px; height:42px; border-radius:8px;
+         border:1px solid #2e2e36; background:#232329; color:var(--fg);
+         font-size:20px; cursor:pointer; font-family:inherit; padding:0 6px; }
+  .key:hover { border-color:#4a4a55; }
+  .key.flash { outline:2px solid var(--acc); }
+  .key .legend { position:absolute; left:4px; bottom:1px; font-size:9px;
+                 color:#6d6d7a; pointer-events:none; }
+  .key.blank { background:#1b1b20; border-color:#26262c; cursor:default; }
+  .key.blank .legend { color:#4d4d58; }
+  #vshift { width:44px; border-radius:8px; border:none; background:#2b2b33;
+            color:#9a9aa2; font-size:17px; cursor:pointer; }
+  #vshift:hover { background:#34343e; }
+  #vshift.on { background:#3a3a55; color:var(--fg); outline:1px solid var(--acc); }
+</style>
+</head>
+<body>
+  <div id="rail">
+    <header>
+      <h1>babel</h1>
+      <div id="strip">
+        <span id="stLink" title="link">🔴</span>
+        <span id="stMic"  title="microphone">·</span>
+        <span id="stTeacher" title="teacher">·</span>
+        <span id="stQueue" title="events waiting for an idle moment"
+              style="display:none">📬</span>
+      </div>
+    </header>
+    <div id="mode">connecting…</div>
+    <div id="feed"></div>
+    <div id="stripwrap">
+      <button id="legendBtn" title="what am I looking at?">?</button>
+      <canvas id="stripcv"></canvas>
+      <div id="legend">
+        <b>the last 12 seconds, scrolling</b><br>
+        <span class="sw" style="background:#21918c"></span>TOP band: YOUR mic energy (mirrored; viridis = louder)<br>
+        <span class="sw" style="background:#d75555"></span>&nbsp;&nbsp;flat RED: mic disabled (muted / away / PTT idle)<br>
+        <span class="sw" style="background:#44bf70"></span>BOTTOM band: engine audio → speaker (viridis; clips dimmer)<br>
+        <span class="sw" style="background:#6a6a2a"></span>&nbsp;&nbsp;flat YELLOW: buffer empty (between turns / trailing silences)<br>
+        <b>out of the engine:</b><br>
+        <span class="sw" style="background:#40e0d0"></span>teal roots under mountains: AI registered your speech (height = words)<br>
+        <span class="sw" style="background:#ffffff"></span>white line: your utterance became a turn<br>
+        <span class="sw" style="background:#c9a0ff"></span>lavender line: teacher reply began<br>
+        <span class="sw" style="background:#e77fb3"></span>magenta tick (low): teacher called run_python<br>
+        <b>into the engine:</b><br>
+        <span class="sw" style="background:#ff9d42"></span>orange tick (top): event sent to the teacher<br>
+        <span class="sw" style="background:#e6c05a"></span>amber tick (top): session start / KICK<br>
+        <span class="sw" style="background:#8fd18f"></span>green tick (low): tool result returned to teacher<br>
+        <span class="sw" style="background:#e05a5a"></span>red line: playback flushed (interrupt) · red ◦ top: error logged<br>
+        <i>real deafness = mic mountains with NO teal roots beneath them</i><br>
+        <span class="sw" style="background:#3a3a44"></span>bottom line: engine — green ok · <span style="color:#8f7fff">violet thinking</span> · pink working · amber reconnecting · red off · grey away<br>
+        <span class="sw" style="background:#55555e"></span>dots on it: ● connect ● heartbeat ● rotation/GoAway<br>
+        <b>🔊 engine sounds</b> (from the speaker; --no-earcons to disable): reach=tool called · ok=ran clean · buzz=<b>FAILED</b> · double-tick=slow job · blip=you barged in · chime=connection · rising=thinking
+      </div>
+    </div>
+    <div id="controls">
+      <button id="btnStop"    title="stop the teacher talking (or just start speaking — it hears you)">✋</button>
+      <button id="btnMic"     title="microphone on/off">🎙️</button>
+      <button id="btnSuspend" title="step away / I'm back">⏸️</button>
+      <button id="btnPower" title="end session — teacher says goodbye & saves notes">⏻</button>
+    </div>
+    <div id="ptt"><button id="pttBtn">HOLD to talk</button></div>
+  </div>
+  <div id="stale">
+    <h2>📵 Session moved to another tab</h2>
+    <p>A newer babel tab took the connection. Close this one,<br>
+       or <b>click anywhere</b> to take over here.</p>
+  </div>
+  <div id="stage">
+    <iframe id="frame" sandbox="allow-scripts" src="/stage/view"></iframe>
+    <div id="kbd" style="display:none">
+      <div id="kbdline">
+        <div id="kbdbuf"></div>
+        <button id="vshift" title="shift — uppercase next letter (physical Shift works too)">⇧</button>
+        <button id="kbdSend" title="send to the teacher (Enter)">⏎</button>
+      </div>
+      <div id="kbdrows"></div>
+    </div>
+  </div>
+
+<script>
+"use strict";
+/* VITAL FEEDBACK: a shell runtime error must never be a silent black mystery —
+   report it to the server log via HTTP (works even when the ws is down). */
+window.addEventListener("error", (e) => {
+  try {
+    fetch("/shell-error", {method: "POST", body: JSON.stringify(
+      {text: `${e.message} @ ${(e.filename||"").split("/").pop()}:${e.lineno}:${e.colno}`})})
+      .catch(() => {});
+  } catch (err) {}
+});
+window.addEventListener("unhandledrejection", (e) => {
+  try {
+    fetch("/shell-error", {method: "POST", body: JSON.stringify(
+      {text: "unhandled rejection: " + String(e.reason)})})
+      .catch(() => {});   // a failed report must NOT itself reject → no error storm
+  } catch (err) {}
+});
+const feedEl = document.getElementById("feed");
+const frame = document.getElementById("frame");
+const modeEl = document.getElementById("mode");
+const el = (id) => document.getElementById(id);
+let ws = null, pttMode = false, talking = false;
+let wsReplaced = false;   // a newer tab took the link: stop retrying, show banner
+/* State that ws/rAF handlers touch is declared UP HERE, before the first
+   connect(), so a handler firing during reconnect churn can never hit a
+   temporal-dead-zone (field 2026-07-04: a mid-init throw left these `const`s
+   uninitialized and every ws message then threw 'before initialization'). */
+let stripOff = null;                   // server-monotonic → local clock offset
+const S = { mic: [], out: [], marks: [], state: [] };   // strip rings
+let tabRetired = false;
+
+/* ── WSPROBE: temporary startup-connection instrumentation (remove once the ~20s
+   connect delay is pinned). `clog` posts a client-timestamped beacon the server
+   records as `CLIENT: WSPROBE …` — grep WSPROBE in the session log. The 1s ticker
+   keeps beaconing while the ws is NOT open: if these land at ~1s intervals the
+   server loop is alive and the browser is withholding the socket; if they bunch
+   up and arrive together, the loop was blocked. readyState: 0=CONNECTING 1=OPEN
+   2=CLOSING 3=CLOSED. */
+function clog(text) {
+  try {
+    fetch("/clientlog", {method: "POST",
+      body: JSON.stringify({text: `WSPROBE +${Math.round(performance.now())}ms ${text}`})})
+      .catch(() => {});   // rejection-safe — a failed beacon must never storm
+  } catch (e) {}
+}
+let wsTicks = 0;
+let wsTicker = setInterval(() => {
+  const rs = ws ? ws.readyState : "none";
+  if (rs === 1 || ++wsTicks > 40) { clearInterval(wsTicker); return; }  // stop once open / after ~40s
+  clog(`tick — ws not open (readyState=${rs}, visibility=${document.visibilityState})`);
+}, 1000);
+
+/* SID = the server-run id this tab was stamped with (the server 302s a bare `/`
+   to `/?s=<boot ts>`). It travels in the ws URL and SURVIVES reloads (unlike a
+   load-time token), so the server can authoritatively refuse any tab from an
+   older run — newest-run tab wins, timing-independent. (field 2026-07-05: a
+   load-time "birth" was laundered higher by the boot-mismatch reload, so a
+   reloaded OLD tab out-ranked the freshly-opened one.) */
+const SID = new URLSearchParams(location.search).get("s") || "";
+
+/* ── the status strip: rendered ONLY from server state ─────────────────────── */
+const MIC_ICON = {                        // [icon, tooltip, pulse]
+  live:      ["🎙️", "mic live — speak any time, even over the teacher (echo-cancelled)", false],
+  muted:     ["🔇", "mic muted", false],
+  away:      ["🚶", "stepped away (⏸) — mic off, teacher is holding its thoughts", false],
+  "ptt-off": ["🎙️", "hold SPACE (or the bar) to be heard", false],
+};
+const TEACHER_ICON = {
+  listening: ["👂", "teacher is listening — your turn", false],
+  speaking:  ["💬", "teacher is speaking", false],
+  thinking:  ["💭", "teacher is thinking (reasoning before it speaks)", true],
+  working:   ["🧠", "teacher is working (tools/jobs running)", true],
+};
+let srv = {muted:false, away:false};        // last server-confirmed control state
+function renderState(d) {
+  srv = {muted: !!d.muted, away: !!d.away};
+  el("stLink").textContent = d.link === "ok" ? "🟢" : "🟠";
+  el("stLink").title = d.link === "ok" ? "connected to Gemini"
+                                       : "reconnecting to Gemini…";
+  el("stLink").classList.toggle("pulse", d.link !== "ok");
+  const m = MIC_ICON[d.mic] || ["·", d.mic, false];
+  el("stMic").textContent = m[0]; el("stMic").title = m[1];
+  el("stMic").classList.toggle("pulse", m[2]);
+  el("stMic").style.opacity = d.mic === "ptt-off" ? .35 : .9;
+  const t = TEACHER_ICON[d.teacher] || ["·", d.teacher, false];
+  el("stTeacher").textContent = t[0] + (d.busy > 1 ? "×" + d.busy : "");
+  el("stTeacher").title = t[1];
+  el("stTeacher").classList.toggle("pulse", t[2]);
+  el("stQueue").style.display = d.queued > 0 ? "" : "none";
+  el("stQueue").title = d.queued + " event(s) waiting for an idle moment";
+  /* buttons mirror server truth */
+  el("btnMic").classList.toggle("off", d.muted);
+  el("btnMic").textContent = d.muted ? "🔇" : "🎙️";
+  el("btnSuspend").classList.toggle("off", d.away);
+  el("btnSuspend").textContent = d.away ? "▶️" : "⏸️";
+  el("btnPower").disabled = !!d.off;
+}
+
+/* ── websocket ─────────────────────────────────────────────────────────────── */
+function connect() {
+  if (ws && ws.readyState <= 1) return;   // already connecting/open: never race ourselves
+  clog(`connect() → new WebSocket(ws://${location.host}/ws?s=${SID})`);
+  ws = new WebSocket(`ws://${location.host}/ws?s=${encodeURIComponent(SID)}`);
+  ws.onopen = () => {                     // (re)connected: any stale banner is over
+    clog("onopen ✓ — connected");
+    wsReplaced = false;
+    el("stale").style.display = "none";
+  };
+  ws.onerror = () => clog("onerror");
+  ws.onclose = (e) => {
+    clog(`onclose code=${e.code} reason=${e.reason || ""} wasClean=${e.wasClean}`);
+    removePartial();
+    if (wsReplaced) {                    // newest tab wins; we lost — say so and STOP
+      el("stale").style.display = "flex";
+      el("stLink").textContent = "📵";
+      el("stLink").title = "session moved to another tab";
+      modeEl.textContent = "moved to another tab";
+      return;
+    }
+    el("stLink").textContent = "🔴";
+    el("stLink").title = "backend unreachable — is the server running?";
+    modeEl.textContent = "backend gone — retrying…";
+    setTimeout(connect, 1500);
+  };
+  ws.onmessage = (m) => {
+    const d = JSON.parse(m.data);
+    if (d.type === "state") { renderState(d); stripState(d); }
+    else if (d.type === "strip") stripIngest(d);
+    else if (d.type === "kbd_flash")
+      d.keys.forEach((g) => flashKey(g, d.color, d.seconds));
+    else if (d.type === "partial") setPartial(d.who, d.text);
+    else if (d.type === "transcript") { removePartial(); addLine(d.who, d.text); }
+    else if (d.type === "logline") addLog(d.level, d.text);
+    else if (d.type === "notice") addNotice(d.text);
+    else if (d.type === "stage") {
+      frame.src = "/stage/view?ts=" + Date.now();
+      // new board = new word to type → drop any un-submitted buffer so a word typed
+      // but never Enter-submitted can't concatenate onto the next (field: "вовквода").
+      if (kbdBuf) { kbdBuf = ""; renderKbdBuf(); }
+    }
+    else if (d.type === "kbd") renderKbd(d.layout, d.colors, d.legends, d.lang, d.physical);
+    else if (d.type === "kbd_colors") applyKbdColors(d.colors);
+    else if (d.type === "replaced") retireTab("replaced");  // a newer tab took over
+    else if (d.type === "bye") retireTab("bye");  // server shut down — retire, don't retry
+    else if (d.type === "exec_js")
+      frame.contentWindow.postMessage({babel:"exec", id:d.id, code:d.code}, "*");
+    else if (d.type === "thought") addThought(d.text);
+    else if (d.type === "status") {
+      pttMode = d.mode === "ptt";
+      el("ptt").style.display = pttMode ? "block" : "none";
+      modeEl.textContent = `${d.mode} · barge-in · ${d.voice}` +
+                           (d.langs ? ` · ${d.langs.join(",")}` : "");
+    }
+  };
+}
+const send = (o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
+
+/* ── transcript rail ───────────────────────────────────────────────────────── */
+function addLine(who, text) {
+  if (!text) return;
+  const tl = document.getElementById("thoughtLive");   // freeze this turn's reasoning
+  if (tl) tl.removeAttribute("id");
+  const p = document.createElement("p");
+  p.className = "line " + who;
+  p.innerHTML = `<span class="who"></span>`;
+  p.appendChild(document.createTextNode(text));
+  feedEl.appendChild(p);
+  feedEl.scrollTop = feedEl.scrollHeight;
+}
+function addNotice(text) {
+  const p = document.createElement("p");
+  p.className = "line notice";
+  p.textContent = text;
+  feedEl.appendChild(p);
+  feedEl.scrollTop = feedEl.scrollHeight;
+}
+function addLog(level, text) {
+  const p = document.createElement("p");
+  p.className = "line " + (level === "WARNING" ? "warn" : "error");
+  p.textContent = (level === "WARNING" ? "⚠️ " : "❌ ") + text;
+  feedEl.appendChild(p);
+  feedEl.scrollTop = feedEl.scrollHeight;
+}
+/* live partial: one greyed line that solidifies on turn end */
+let partialEl = null;
+function setPartial(who, text) {
+  if (!text) { removePartial(); return; }
+  if (!partialEl) {
+    partialEl = document.createElement("p");
+    partialEl.className = "line partial " + who;
+    partialEl.innerHTML = `<span class="who"></span>`;
+    partialEl.appendChild(document.createTextNode(""));
+    feedEl.appendChild(partialEl);
+  }
+  partialEl.lastChild.textContent = text;
+  feedEl.scrollTop = feedEl.scrollHeight;
+}
+function removePartial() {
+  if (partialEl) { partialEl.remove(); partialEl = null; }
+}
+
+/* ── messages from the stage iframe (the bridge) ───────────────────────────── */
+window.addEventListener("message", (e) => {
+  const d = e.data;
+  if (!d || !d.babel) return;
+  if (d.babel === "feed") send({type:"event", payload:d.payload, engage:d.engage});
+  else if (d.babel === "jserror") send({type:"jserror", text:d.text});
+  else if (d.babel === "speak") speakClip(d.text, d.lang, d.voice);
+  else if (d.babel === "exec_result")
+    send({type:"js_result", id:d.id, ok:d.ok, result:d.result, error:d.error});
+});
+
+/* ── native-speaker clips (browser audio is fine: the backend AEC cancels ──
+   everything this Mac plays, so clips can't leak into the teacher's ears) ── */
+function speakClip(text, lang, voice) {
+  const url = `/clip?text=${encodeURIComponent(text)}` +
+              (lang ? `&lang=${encodeURIComponent(lang)}` : "") +
+              (voice ? `&voice=${encodeURIComponent(voice)}` : "");
+  new Audio(url).play().catch(() => {});
+}
+
+/* Earcons are now synthesized and played SERVER-side through the AEC output path
+   (see earcon() in server.py) — the browser WebAudio version never sounded because
+   AudioContext needs a user gesture a voice-only session never makes. */
+
+/* ── live reasoning (include_thoughts): one growing muted line per turn; it ──
+   freezes in place when the tutor's spoken transcript lands (see addLine). ── */
+function addThought(text) {
+  if (!text) return;
+  let box = document.getElementById("thoughtLive");
+  if (!box) {
+    box = document.createElement("p");
+    box.id = "thoughtLive";
+    box.className = "line think";
+    box.style.cssText = "opacity:.5;font-style:italic;font-size:.85em";
+    feedEl.appendChild(box);
+    box.textContent = "💭 ";
+  }
+  box.textContent += text;
+  feedEl.scrollTop = feedEl.scrollHeight;
+}
+
+/* ── control buttons: commands only — the server broadcasts resulting state ── */
+el("btnStop").onclick = () => send({type:"ui", kind:"interrupt"});
+el("btnMic").onclick = () => send({type:"ui", kind:"mic", on:srv.muted});
+el("btnSuspend").onclick = () => {
+  const goingAway = !srv.away;
+  send({type:"ui", kind:"suspend", on:goingAway});
+  addNotice(goingAway ? "stepped away — press ▶️ when you're back"
+                      : "welcome back");
+};
+el("btnPower").onclick = (e) => {
+  e.target.disabled = true;
+  send({type:"ui", kind:"shutdown"});
+  addNotice("ending session — the teacher is wrapping up…");
+};
+/* Firefox throttles background-tab timers, so the 1.5s retry can stall for
+   many seconds while a tab is not looked at. Looking at the tab IS the natural
+   "I want this one" gesture — reconnect instantly on focus/visibility. */
+function wakeRetry() {
+  if (!wsReplaced) connect();             // no-op if already connected (guard above)
+}
+window.addEventListener("focus", wakeRetry);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) wakeRetry();
+  send({type:"ui", kind:"visibility", visible: !document.hidden});
+});
+el("stale").onclick = () => {                 // take the session over HERE
+  if (tabRetired) return;                     // retired tabs are terminal
+  wsReplaced = false;
+  el("stale").style.display = "none";
+  connect();
+};
+
+/* ── on-screen keyboard: colorable keys, position-mapped physical typing ────
+   Pure mechanism: the server tells us layout + colors + physical-keycap legends
+   + hardware form factor; what colors MEAN is the teacher's business. Presses
+   reach the teacher silently; Enter submits loud. Shift (physical, or ⇧ by the
+   send button) gives uppercase.
+   GEOMETRY IS TRUTH: keys render at their PHYSICAL grid positions (ANSI/ISO,
+   auto-detected). Keys with no letter in this language render blank+dim with
+   just the keycap legend — the student's fingers navigate past real keys, so
+   the screen must show them. NOTE the Apple-ISO quirk: on Mac ISO hardware the
+   code "Backquote" is PHYSICALLY the key left of Z, and "IntlBackslash" is the
+   top-left key — both macOS vk numbering and the browser agree, so the ISO grid
+   below encodes that. The self-healing legends catch any machine that differs. */
+let kbdMap = {};                 // event.code -> base glyph
+let kbdLegends = {};             // event.code -> user's physical keycap char
+let kbdLang = "en";
+let kbdPhysical = "ansi";
+let kbdGridCodes = new Set();    // every physically-rendered code (for swallowing)
+let kbdBuf = "";
+let kbdShift = false;            // physical Shift held OR virtual ⇧ latched
+let kbdVShift = false;
+const legendWarned = {};         // once-per-code legend mismatch reports
+
+const KBD_GRID = {
+  ansi: {
+    digits: ["Backquote","Digit1","Digit2","Digit3","Digit4","Digit5","Digit6",
+             "Digit7","Digit8","Digit9","Digit0","Minus","Equal"],
+    top:    ["KeyQ","KeyW","KeyE","KeyR","KeyT","KeyY","KeyU","KeyI","KeyO",
+             "KeyP","BracketLeft","BracketRight","Backslash"],
+    home:   ["KeyA","KeyS","KeyD","KeyF","KeyG","KeyH","KeyJ","KeyK","KeyL",
+             "Semicolon","Quote"],
+    bottom: ["KeyZ","KeyX","KeyC","KeyV","KeyB","KeyN","KeyM","Comma",
+             "Period","Slash"],
+  },
+  iso: {   // Apple ISO: IntlBackslash = top-left key, Backquote = left of Z
+    digits: ["IntlBackslash","Digit1","Digit2","Digit3","Digit4","Digit5",
+             "Digit6","Digit7","Digit8","Digit9","Digit0","Minus","Equal"],
+    top:    ["KeyQ","KeyW","KeyE","KeyR","KeyT","KeyY","KeyU","KeyI","KeyO",
+             "KeyP","BracketLeft","BracketRight"],
+    home:   ["KeyA","KeyS","KeyD","KeyF","KeyG","KeyH","KeyJ","KeyK","KeyL",
+             "Semicolon","Quote","Backslash"],
+    bottom: ["Backquote","KeyZ","KeyX","KeyC","KeyV","KeyB","KeyN","KeyM",
+             "Comma","Period","Slash"],
+  },
+};
+// physical row stagger in U units (1U = key pitch): Tab 1.5, Caps 1.75,
+// ANSI Shift 2.25 / ISO Shift 1.25 (the extra key fills to 2.25 before Z)
+const KBD_STAGGER = {
+  ansi: { digits: 0, top: 1.5, home: 1.75, bottom: 2.25 },
+  iso:  { digits: 0, top: 1.5, home: 1.75, bottom: 1.25 },
+};
+
+function shifted(glyph) {
+  const up = glyph.toLocaleUpperCase(kbdLang);
+  return up.length === 1 ? up : glyph;     // ß→SS etc: keep base
+}
+function renderKbd(layout, colors, legends, lang, physical) {
+  if (legends) kbdLegends = legends;
+  if (lang) kbdLang = lang;
+  if (physical) kbdPhysical = KBD_GRID[physical] ? physical : "ansi"; // jis→ansi for now
+  kbdMap = {};
+  for (const row of (layout || []))
+    for (const [code, glyph] of row) kbdMap[code] = glyph;
+  const grid = KBD_GRID[kbdPhysical];
+  kbdGridCodes = new Set(Object.values(grid).flat());
+  const rows = el("kbdrows");
+  rows.innerHTML = "";
+  for (const rn of ["digits", "top", "home", "bottom"]) {
+    if (rn === "digits" && !grid.digits.some((c) => kbdMap[c])) continue;
+    const r = document.createElement("div");
+    r.className = "krow";
+    r.style.marginLeft = (KBD_STAGGER[kbdPhysical][rn] * 52) + "px"; // 1U = 46px key + 6px gap
+    for (const code of grid[rn]) {
+      const glyph = kbdMap[code];
+      const b = document.createElement("button");
+      b.dataset.code = code;
+      if (glyph) {
+        b.className = "key";
+        b.dataset.glyph = glyph;
+        b.appendChild(document.createTextNode(glyph));
+        b.onclick = () => kbdPress(b.dataset.glyph, b);
+      } else {
+        b.className = "key blank";          // a real key with no letter here
+        b.tabIndex = -1;
+        b.appendChild(document.createTextNode(""));
+      }
+      const leg = (kbdLegends || {})[code];
+      if (leg && (!glyph || leg.toLowerCase() !== glyph.toLowerCase())) {
+        const sp = document.createElement("span");
+        sp.className = "legend"; sp.textContent = leg;
+        b.appendChild(sp);
+      }
+      r.appendChild(b);
+    }
+    rows.appendChild(r);
+  }
+  applyKbdColors(colors || {});
+  renderKbdBuf();
+  el("kbd").style.display = "";
+}
+function updateKbdShift() {
+  const on = kbdShift || kbdVShift;
+  document.querySelectorAll("#kbdrows .key[data-glyph]").forEach((b) => {
+    b.firstChild.textContent = on ? shifted(b.dataset.glyph) : b.dataset.glyph;
+  });
+  el("vshift").classList.toggle("on", on);
+}
+let kbdColors = {};
+function applyKbdColors(colors) {
+  kbdColors = colors || {};
+  document.querySelectorAll("#kbdrows .key[data-glyph]").forEach((b) => {
+    const c = kbdColors[b.dataset.glyph];
+    b.style.background = c || "";
+    b.style.color = c ? "#111" : "";
+  });
+}
+function flashKey(glyph, color, seconds) {
+  const b = keyBtn(glyph);
+  if (!b) return;
+  const base = kbdColors[glyph] || "";
+  b.style.transition = "none";
+  b.style.background = color; b.style.color = "#111";
+  void b.offsetWidth;                          // commit the lit state
+  b.style.transition = `background ${seconds}s cubic-bezier(.2,.7,.4,1), ` +
+                       `color ${seconds}s cubic-bezier(.2,.7,.4,1)`;
+  b.style.background = base; b.style.color = base ? "#111" : "";
+  setTimeout(() => { b.style.transition = "none"; }, seconds * 1000 + 60);
+}
+function healLegend(code, key) {
+  // observation beats the OS map: relabel the key and report once
+  kbdLegends[code] = key;
+  const b = document.querySelector(`#kbdrows .key[data-code="${code}"]`);
+  if (b) {
+    let sp = b.querySelector(".legend");
+    if (!sp) { sp = document.createElement("span"); sp.className = "legend"; b.appendChild(sp); }
+    sp.textContent = key;
+  }
+}
+function keyBtn(glyph) {
+  return [...document.querySelectorAll("#kbdrows .key")]
+         .find((b) => b.dataset.glyph === glyph);
+}
+function kbdPress(glyph, btn) {
+  const ch = (kbdShift || kbdVShift) ? shifted(glyph) : glyph;
+  kbdBuf += ch;
+  kbdVShift = false; updateKbdShift();           // virtual shift is one-shot
+  renderKbdBuf();
+  if (btn) { btn.classList.add("flash"); setTimeout(() => btn.classList.remove("flash"), 180); }
+  send({type:"kbd", kind:"press", key:ch});
+}
+function renderKbdBuf() {
+  const buf = el("kbdbuf");
+  if (kbdBuf) buf.textContent = kbdBuf;
+  else buf.innerHTML = '<span class="hint">type here — your physical keys map by position · Enter sends</span>';
+}
+function kbdSubmit() {
+  if (!kbdBuf) return;
+  send({type:"kbd", kind:"submit", text:kbdBuf});
+  addLine("you", "⌨️ " + kbdBuf);
+  kbdBuf = ""; renderKbdBuf();
+}
+el("kbdSend").onclick = kbdSubmit;
+el("vshift").onclick = () => { kbdVShift = !kbdVShift; updateKbdShift(); };
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Shift") { kbdShift = true; updateKbdShift(); return; }
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (pttMode && e.code === "Space") return;          // PTT owns space
+  if (e.code === "Enter" && kbdBuf) { e.preventDefault(); kbdSubmit(); return; }
+  if (e.code === "Backspace" && kbdBuf) {
+    e.preventDefault(); kbdBuf = kbdBuf.slice(0, -1); renderKbdBuf(); return;
+  }
+  // self-healing legends: a real keystroke is the ground truth for what's
+  // printed on that keycap — observation beats the OS map, once, loudly
+  if (e.key.length === 1 && kbdGridCodes.has(e.code)) {
+    const leg = kbdLegends[e.code];
+    if ((!leg || e.key.toLowerCase() !== leg.toLowerCase()) && !legendWarned[e.code]) {
+      legendWarned[e.code] = true;
+      if (leg) send({type:"kbd", kind:"legend_mismatch", code:e.code,
+                     expected:leg, actual:e.key});
+      healLegend(e.code, e.key);
+    }
+  }
+  const glyph = kbdMap[e.code];
+  if (glyph && !e.repeat) {
+    e.preventDefault();
+    kbdPress(glyph, keyBtn(glyph));
+  } else if (kbdGridCodes.has(e.code) && !e.repeat) {
+    e.preventDefault();   // a blank key: swallow it (no Firefox quick-find etc.)
+  }
+});
+window.addEventListener("keyup", (e) => {
+  if (e.key === "Shift") { kbdShift = false; updateKbdShift(); }
+});
+
+/* ── the diagnostic STRIP: 12s of conversational truth, always scrolling ────
+   The SINGLE SOURCE OF TRUTH for what crosses the engine. Lanes: teacher audio
+   band (top) · your mic, mirrored mountains (center) · engine line (bottom).
+   Marks — OUT of the engine: teal=speech registered, white=turn commit,
+   lavender=reply began, magenta=tool call. INTO the engine: orange=event,
+   green=tool result, amber=session/KICK. red=flush/error. Real deafness now
+   reads directly off the strip: mic mountains with NO teal roots under them. */
+const stripC = el("stripcv"), sctx = stripC.getContext("2d");
+const STRIP_SPAN = 12;                 // seconds visible
+const VIRIDIS = ["#440154","#471365","#482475","#463480","#414487","#3b528b",
+  "#355f8d","#2f6c8e","#2a768e","#25848e","#21918c","#1e9c89","#22a884",
+  "#2fb47c","#44bf70","#5ec962","#7ad151","#9bd93c","#bddf26","#dfe318","#fde725"];
+function vir(db) {
+  const t = Math.max(0, Math.min(1, (db + 75) / 58));
+  return VIRIDIS[Math.round(t * (VIRIDIS.length - 1))];
+}
+function nowS() { return performance.now() / 1000; }
+function stripIngest(d) {
+  const off = nowS() - d.now;
+  stripOff = stripOff === null ? off : stripOff * 0.9 + off * 0.1;
+  for (const [t, db] of d.mic) S.mic.push([t + stripOff, db]);
+  for (const [t, db, k] of d.out) S.out.push([t + stripOff, db, k]);
+  for (const [t, k, v] of d.marks) {
+    const lt = t + stripOff;
+    S.marks.push([lt, k, v]);
+    if (k === "flush") S.out = S.out.filter((o) => o[0] <= lt);  // audio died here
+  }
+}
+function stripState(d) {               // engine/mic status timeline from snapshots
+  let eng = "#44bf70";                                   // green: fine
+  if (d.link !== "ok") eng = "#e6a23a";                  // amber: reconnecting
+  if (d.teacher === "thinking") eng = "#8f7fff";         // violet: reasoning
+  if (d.teacher === "working") eng = "#e77fb3";          // pink: tools/jobs
+  if (d.away) eng = "#55555e";                           // grey: suspended
+  if (d.off) eng = "#e05a5a";                            // red: shutting down
+  S.state.push([nowS(), d.mic, eng]);                    // [t, micStatus, engColor]
+}
+function stateAt(t) {
+  for (let i = S.state.length - 1; i >= 0; i--)
+    if (S.state[i][0] <= t) return S.state[i];
+  return S.state[0] || [0, "live", "#44bf70"];
+}
+function drawStrip() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = stripC.clientWidth, h = 64;
+  if (stripC.width !== w * dpr) { stripC.width = w * dpr; stripC.height = h * dpr; }
+  sctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const now = nowS(), x = (t) => w - ((now - t) / STRIP_SPAN) * w;
+  sctx.clearRect(0, 0, w, h);
+  // ── MIC band (top): viridis mountains (mirrored) when live; flat RED when disabled ──
+  const cyMic = 17, cyEng = 47, bw = Math.max(2, w / (STRIP_SPAN * 10));
+  for (const [t, db] of S.mic) {
+    if (t < now - STRIP_SPAN || t > now) continue;
+    const st = stateAt(t);
+    if (st[1] === "muted" || st[1] === "ptt-off" || st[1] === "away") continue; // red covers it
+    const norm = Math.max(0, Math.min(1, (db + 70) / 50)), hh = 1 + norm * 14;
+    sctx.fillStyle = vir(db);
+    sctx.fillRect(x(t), cyMic - hh, bw, hh * 2);
+  }
+  for (let px = 0; px < w; px += 3) {                    // mic disabled → flat red line
+    const st = stateAt(now - ((w - px) / w) * STRIP_SPAN);
+    if (st[1] === "muted" || st[1] === "ptt-off" || st[1] === "away") {
+      sctx.fillStyle = "#d75555"; sctx.fillRect(px, cyMic - 1, 3, 2);
+    }
+  }
+  // ── ENGINE band (bottom): viridis bars (mirrored) = audio sent to the speaker; the
+  //    yellow baseline shows wherever the buffer is EMPTY — between turns AND clamped
+  //    room-tone tails (so those trailing silences are now VISIBLE) ──
+  sctx.fillStyle = "#6a6a2a"; sctx.fillRect(0, cyEng - 1, w, 2);
+  for (const [t, db, k] of S.out) {
+    if (t < now - STRIP_SPAN || t > now + 0.3) continue;
+    const norm = Math.max(0, Math.min(1, (db + 60) / 45)), hh = 1 + norm * 14;
+    sctx.fillStyle = vir(db);
+    if (k === "clip") sctx.globalAlpha = 0.6;
+    sctx.fillRect(x(t), cyEng - hh, bw, hh * 2);
+    sctx.globalAlpha = 1;
+  }
+  for (let px = 0; px < w; px += 4) {                    // engine connection state, very bottom
+    sctx.fillStyle = stateAt(now - ((w - px) / w) * STRIP_SPAN)[2];
+    sctx.fillRect(px, h - 2, 4, 2);
+  }
+  const cy = cyMic;                                      // teal 'AI heard you' roots hang here
+  // marks
+  for (const [t, k, v] of S.marks) {
+    if (t < now - STRIP_SPAN || t > now) continue;
+    const px = x(t);
+    if (k === "partial") {             // teal roots: height by word count
+      sctx.fillStyle = "#40e0d0";
+      sctx.fillRect(px, cy + 16, 2, 3 + Math.min(9, v * 1.5));
+    } else if (k === "commit") {
+      sctx.fillStyle = "#ffffff"; sctx.fillRect(px, 15, 1.5, h - 21);
+    } else if (k === "reply") {
+      sctx.fillStyle = "#c9a0ff"; sctx.fillRect(px, 33, 1.5, 28);
+    } else if (k === "event") {         // event → engine (into engine)
+      sctx.fillStyle = "#ff9d42"; sctx.fillRect(px, 0, 2, 7);
+    } else if (k === "kick") {          // session/KICK text → engine (into engine)
+      sctx.fillStyle = "#e6c05a"; sctx.fillRect(px, 0, 2, 7);
+    } else if (k === "call") {          // model → run_python (out of engine)
+      sctx.fillStyle = "#e77fb3"; sctx.fillRect(px, h - 12, 2, 5);
+    } else if (k === "response") {      // tool result → model (into engine)
+      sctx.fillStyle = "#8fd18f"; sctx.fillRect(px, h - 12, 2, 5);
+    } else if (k === "flush") {
+      sctx.fillStyle = "#e05a5a"; sctx.fillRect(px, 3, 1.5, h - 9);
+    } else if (k === "err") {
+      sctx.fillStyle = "#e05a5a";
+      sctx.beginPath(); sctx.arc(px, 5, 3, 0, 7); sctx.fill();
+    } else if (k === "conn" || k === "hb" || k === "goaway" || k === "suspend_on"
+               || k === "suspend_off") {
+      sctx.fillStyle = k === "conn" ? "#44bf70" : k === "hb" ? "#55555e" : "#e6a23a";
+      sctx.fillRect(px, h - 6, 2, 3);
+    }
+  }
+  // prune old data occasionally
+  const cut = now - STRIP_SPAN - 3;
+  if (S.mic.length && S.mic[0][0] < cut - 5) {
+    for (const key of ["mic", "out", "marks"]) S[key] = S[key].filter((e) => e[0] > cut);
+    S.state = S.state.filter((e, i) => e[0] > cut || i === S.state.length - 1);
+  }
+  requestAnimationFrame(drawStrip);
+}
+requestAnimationFrame(drawStrip);
+el("legendBtn").onclick = () => {
+  const l = el("legend");
+  l.style.display = l.style.display === "block" ? "none" : "block";
+};
+
+/* ── tab supremacy: the SERVER decides. A tab is stamped with the server-run id
+   (?s=<boot ts>) that survives reloads; the server holds the session for the
+   current-run tab and sends {replaced} to any tab from an older run (or a
+   displaced same-run duplicate). On {replaced} we retire — no client-side
+   claim/BroadcastChannel race, no reload-rebirth. */
+function retireTab(reason) {
+  if (tabRetired) return;
+  tabRetired = true; wsReplaced = true;   // wsReplaced ⇒ onclose won't retry (no
+  clearInterval(wsTicker);                // ws hammering → no Firefox reconnect backoff)
+  try { if (ws) ws.close(); } catch (err) {}
+  window.close();                       // permitted for single-history-entry tabs
+  setTimeout(() => {                    // blocked from closing? show a terminal screen
+    el("stale").innerHTML = reason === "bye"
+      ? "<h2>👋 Session ended</h2><p>The babel server has shut down.<br>You can close this tab.</p>"
+      : "<h2>🪦 Stale tab</h2><p>A newer babel tab has taken over.<br>This one is retired — please close it.</p>";
+    el("stale").style.display = "flex";
+  }, 300);
+}
+
+/* ── PTT: true hold-to-talk ────────────────────────────────────────────────── */
+const pttBtn = el("pttBtn");
+function setTalking(t) {
+  if (!pttMode || talking === t) return;
+  talking = t;
+  pttBtn.classList.toggle("live", t);
+  pttBtn.textContent = t ? "🎤 LIVE — release when done" : "HOLD to talk";
+  send({type:"ptt", talking:t});
+}
+window.addEventListener("keydown", (e) => {
+  if (e.code === "Space" && !e.repeat && e.target === document.body) {
+    e.preventDefault(); setTalking(true);
+  }
+});
+window.addEventListener("keyup", (e) => {
+  if (e.code === "Space") { e.preventDefault(); setTalking(false); }
+});
+pttBtn.addEventListener("pointerdown", () => setTalking(true));
+pttBtn.addEventListener("pointerup",   () => setTalking(false));
+pttBtn.addEventListener("pointerleave",() => setTalking(false));
+window.addEventListener("blur", () => setTalking(false));
+
+connect();
+try { fetch("/shell-error", {method:"POST", body: JSON.stringify({text:"(not an error) shell script initialized OK"})}); } catch (e) {}
+</script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+# babel webapp — top-level runtime dependencies (Python 3.12+, macOS)
+# Install: python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+google-genai        # Gemini Live API client (websockets pulled in transitively)
+aiohttp             # the local async web server + browser bridge
+python-dotenv       # loads secrets from .env
+PyYAML              # the teacher's notes.yaml
+requests            # helper HTTP calls (clips, image search)
+Pillow              # image compositing (contact sheets for vision picks)
+websockets          # imported directly for connection-close handling
