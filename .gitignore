@@ -17,8 +17,11 @@ key.txt
 # tutor toy diagnostic artifacts (logs + wavs)
 proto/diagnostics/
 
-# webapp diagnostic artifacts (logs + wavs)
+# webapp diagnostic artifacts (legacy jrec journal + wavs)
 webapp/diagnostics/
+
+# raw session capture — logs/NNNNNN/{ws.jsonseq,log.jsonseq,playback.wav,meta.json}
+webapp/logs/
 
 # backend-AEC experiment: compiled helper + probe/toy artifacts
 experiments/09-backend-aec/aec_helper

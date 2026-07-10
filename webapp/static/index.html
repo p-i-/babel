@@ -106,22 +106,12 @@
       <canvas id="stripcv"></canvas>
       <div id="legend">
         <b>the last 12 seconds, scrolling</b><br>
-        <span class="sw" style="background:#21918c"></span>TOP band: YOUR mic energy (mirrored; viridis = louder)<br>
+        <span class="sw" style="background:#21918c"></span>TOP band: YOUR mic level (mirrored; viridis = louder)<br>
         <span class="sw" style="background:#d75555"></span>&nbsp;&nbsp;flat RED: mic disabled (muted / away / PTT idle)<br>
-        <span class="sw" style="background:#44bf70"></span>BOTTOM band: engine audio → speaker (viridis; clips dimmer)<br>
-        <span class="sw" style="background:#6a6a2a"></span>&nbsp;&nbsp;flat YELLOW: buffer empty (between turns / trailing silences)<br>
-        <b>out of the engine:</b><br>
-        <span class="sw" style="background:#40e0d0"></span>teal roots under mountains: AI registered your speech (height = words)<br>
-        <span class="sw" style="background:#ffffff"></span>white line: your utterance became a turn<br>
-        <span class="sw" style="background:#c9a0ff"></span>lavender line: teacher reply began<br>
-        <span class="sw" style="background:#e77fb3"></span>magenta tick (low): teacher called run_python<br>
-        <b>into the engine:</b><br>
-        <span class="sw" style="background:#ff9d42"></span>orange tick (top): event sent to the teacher<br>
-        <span class="sw" style="background:#e6c05a"></span>amber tick (top): session start / KICK<br>
-        <span class="sw" style="background:#8fd18f"></span>green tick (low): tool result returned to teacher<br>
-        <span class="sw" style="background:#e05a5a"></span>red line: playback flushed (interrupt) · red ◦ top: error logged<br>
-        <i>real deafness = mic mountains with NO teal roots beneath them</i><br>
+        <span class="sw" style="background:#44bf70"></span>BOTTOM band: speaker level — engine audio + clips (dimmer)<br>
+        <span class="sw" style="background:#6a6a2a"></span>&nbsp;&nbsp;flat YELLOW: silence (nothing playing)<br>
         <span class="sw" style="background:#3a3a44"></span>bottom line: engine — green ok · <span style="color:#8f7fff">violet thinking</span> · pink working · amber reconnecting · red off · grey away<br>
+        <i>the forensic timeline lives in the session's ws.jsonl / log.jsonl</i><br>
         <span class="sw" style="background:#55555e"></span>dots on it: ● connect ● heartbeat ● rotation/GoAway<br>
         <b>🔊 engine sounds</b> (from the speaker; --no-earcons to disable): reach=tool called · ok=ran clean · buzz=<b>FAILED</b> · double-tick=slow job · blip=you barged in · chime=connection · rising=thinking
       </div>
@@ -180,7 +170,7 @@ let wsReplaced = false;   // a newer tab took the link: stop retrying, show bann
    temporal-dead-zone (field 2026-07-04: a mid-init throw left these `const`s
    uninitialized and every ws message then threw 'before initialization'). */
 let stripOff = null;                   // server-monotonic → local clock offset
-const S = { mic: [], out: [], marks: [], state: [] };   // strip rings
+const S = { mic: [], out: [], state: [] };   // strip rings (mic + speaker levels)
 let tabRetired = false;
 
 /* ── WSPROBE: temporary startup-connection instrumentation (remove once the ~20s
@@ -622,10 +612,9 @@ window.addEventListener("keyup", (e) => {
 /* ── the diagnostic STRIP: 12s of conversational truth, always scrolling ────
    The SINGLE SOURCE OF TRUTH for what crosses the engine. Lanes: teacher audio
    band (top) · your mic, mirrored mountains (center) · engine line (bottom).
-   Marks — OUT of the engine: teal=speech registered, white=turn commit,
-   lavender=reply began, magenta=tool call. INTO the engine: orange=event,
-   green=tool result, amber=session/KICK. red=flush/error. Real deafness now
-   reads directly off the strip: mic mountains with NO teal roots under them. */
+   A live rough-meter only (mic level on top, speaker level on the bottom, engine
+   state on the very-bottom line). The forensic timeline moved to the session's
+   raw capture (ws.jsonl / log.jsonl) processed offline. */
 const stripC = el("stripcv"), sctx = stripC.getContext("2d");
 const STRIP_SPAN = 12;                 // seconds visible
 const VIRIDIS = ["#440154","#471365","#482475","#463480","#414487","#3b528b",
@@ -641,11 +630,6 @@ function stripIngest(d) {
   stripOff = stripOff === null ? off : stripOff * 0.9 + off * 0.1;
   for (const [t, db] of d.mic) S.mic.push([t + stripOff, db]);
   for (const [t, db, k] of d.out) S.out.push([t + stripOff, db, k]);
-  for (const [t, k, v] of d.marks) {
-    const lt = t + stripOff;
-    S.marks.push([lt, k, v]);
-    if (k === "flush") S.out = S.out.filter((o) => o[0] <= lt);  // audio died here
-  }
 }
 function stripState(d) {               // engine/mic status timeline from snapshots
   let eng = "#44bf70";                                   // green: fine
@@ -700,41 +684,10 @@ function drawStrip() {
     sctx.fillStyle = stateAt(now - ((w - px) / w) * STRIP_SPAN)[2];
     sctx.fillRect(px, h - 2, 4, 2);
   }
-  const cy = cyMic;                                      // teal 'AI heard you' roots hang here
-  // marks
-  for (const [t, k, v] of S.marks) {
-    if (t < now - STRIP_SPAN || t > now) continue;
-    const px = x(t);
-    if (k === "partial") {             // teal roots: height by word count
-      sctx.fillStyle = "#40e0d0";
-      sctx.fillRect(px, cy + 16, 2, 3 + Math.min(9, v * 1.5));
-    } else if (k === "commit") {
-      sctx.fillStyle = "#ffffff"; sctx.fillRect(px, 15, 1.5, h - 21);
-    } else if (k === "reply") {
-      sctx.fillStyle = "#c9a0ff"; sctx.fillRect(px, 33, 1.5, 28);
-    } else if (k === "event") {         // event → engine (into engine)
-      sctx.fillStyle = "#ff9d42"; sctx.fillRect(px, 0, 2, 7);
-    } else if (k === "kick") {          // session/KICK text → engine (into engine)
-      sctx.fillStyle = "#e6c05a"; sctx.fillRect(px, 0, 2, 7);
-    } else if (k === "call") {          // model → run_python (out of engine)
-      sctx.fillStyle = "#e77fb3"; sctx.fillRect(px, h - 12, 2, 5);
-    } else if (k === "response") {      // tool result → model (into engine)
-      sctx.fillStyle = "#8fd18f"; sctx.fillRect(px, h - 12, 2, 5);
-    } else if (k === "flush") {
-      sctx.fillStyle = "#e05a5a"; sctx.fillRect(px, 3, 1.5, h - 9);
-    } else if (k === "err") {
-      sctx.fillStyle = "#e05a5a";
-      sctx.beginPath(); sctx.arc(px, 5, 3, 0, 7); sctx.fill();
-    } else if (k === "conn" || k === "hb" || k === "goaway" || k === "suspend_on"
-               || k === "suspend_off") {
-      sctx.fillStyle = k === "conn" ? "#44bf70" : k === "hb" ? "#55555e" : "#e6a23a";
-      sctx.fillRect(px, h - 6, 2, 3);
-    }
-  }
   // prune old data occasionally
   const cut = now - STRIP_SPAN - 3;
   if (S.mic.length && S.mic[0][0] < cut - 5) {
-    for (const key of ["mic", "out", "marks"]) S[key] = S[key].filter((e) => e[0] > cut);
+    for (const key of ["mic", "out"]) S[key] = S[key].filter((e) => e[0] > cut);
     S.state = S.state.filter((e, i) => e[0] > cut || i === S.state.length - 1);
   }
   requestAnimationFrame(drawStrip);

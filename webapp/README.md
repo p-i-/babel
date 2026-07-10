@@ -36,13 +36,11 @@ then teacher-owned) plus conventions:
 - **The shell reports its own faults**: runtime JS errors and a boot beacon go
   to the server log (`SHELL JS ERROR:`) — a broken shell is never a silent
   black mystery.
-- **The diagnostic strip** (above the buttons; click ? for the legend): 12
-  scrolling seconds of ground truth — teacher audio band (playback clock), your
-  mic as mirrored viridis mountains, teal roots where the AI registered your
-  speech, white turn-commits, lavender reply-starts, orange outbound events, red
-  flushes/errors, engine line (green/pink/amber/red/grey), and a red background
-  tint when you're SPEAKING BUT NOT HEARD (press ✋; it recovers). The teacher is
-  also told about stalls. flash_keys() gives the teacher decaying key highlights.
+- **The level strip** (above the buttons; click ? for the legend): 12 scrolling
+  seconds of mic + speaker audio levels (viridis mountains, brighter = louder),
+  an engine-state line (green ok / pink working / amber reconnecting / red off /
+  grey away), and a red marker when the mic is disabled. A live rough-meter only —
+  the full forensic timeline lives in the **session capture** (see below).
 - **Audio = OS-level echo cancellation** (`aec_helper`, auto-built from
   `aec_helper.swift` at boot — needs `swiftc`): the mic stays OPEN while the teacher
   speaks, so you **interrupt by voice** — just start talking (server VAD yields the
@@ -99,8 +97,35 @@ notes" kick. Expected server closes log as WARNING/INFO; ERROR means a real faul
   `workspace/helpers.py` once; never overwritten).
 - `workspace/` — the teacher's home (gitignored): its notes.yaml, staged pages,
   downloaded images. **Delete it to reset the student.**
-- `clips/` — pronunciation clip cache (gitignored). `diagnostics/` — per-session logs
-  + mic/tutor WAVs.
+- `clips/` — pronunciation clip cache (gitignored).
+- `capture.py` — the raw session recorder (see below).
+- `logs/NNNNNN/` — one folder per session, gitignored (see below).
+- `../tooling/generate_journal.py` — renders a session capture into a readable timeline.
+
+## Session capture — the black box
+
+Doctrine: **capture RAW in the live path, interpret OFFLINE.** Every session writes
+`webapp/logs/NNNNNN/` (an incrementing `.counter`; delete old ones freely):
+
+- **`ws.jsonseq`** — every WebSocket frame to/from the engine, in+out, **verbatim**
+  (mic + model audio ride along as base64). The raw source of truth. RFC-7464 json-seq:
+  records delimited by an ASCII Record Separator (`0x1E`, provably absent from JSON),
+  so frames stay byte-exact even when Gemini pretty-prints them across newlines.
+- **`log.jsonseq`** — every log record, untruncated. Both files stamp each record
+  `<wall> <mono>` (both clocks: wall for absolute/cross-process, mono for gap math;
+  their divergence would expose a clock step).
+- **`meta.json`** — session config INCL. the full `LiveConnectConfig` (system prompt,
+  tools, thinking/speech/VAD/compression). The setup frame is sent inside `connect()`
+  before the tap, so this is its captured source — the capture is self-contained.
+- **`playback.wav`** — the actual speaker mix (model + clips + earcons + tail-clamp);
+  the one artifact that never crosses the wire.
+- **`report.txt`** — a readable timeline auto-rendered at shutdown: the log narrative +
+  audio collapsed to run-summaries + turn-aware stall detection. `snap_NN.png` —
+  screenshots pulled out of the wire and referenced (`📸`) inline.
+
+`generate_journal.py <session-dir>` regenerates `report.txt` on demand. The wire
+payload schema is documented in `research/vendor-docs/live-api-websockets-reference.md`,
+so a future agent can decode `ws.jsonseq` from first principles.
 
 ## Validated headless (2026-07-02; AEC integration 2026-07-03)
 

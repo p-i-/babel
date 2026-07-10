@@ -46,6 +46,8 @@ from google.genai import errors as genai_errors
 from google.genai import types
 from websockets.exceptions import ConnectionClosed
 
+from capture import Capture, wrap_ws, CaptureLogHandler
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[0]
 load_dotenv(ROOT / ".env")
@@ -270,17 +272,14 @@ def is_conn_closed(exc):
 class ChatLogHandler(logging.Handler):
     """Mirror this app's WARNING/ERROR records into the browser chat rail:
     anything worth logging loudly is worth showing the user (⚠️/❌)."""
-    def __init__(self, buf, strip_marks=None):
+    def __init__(self, buf):
         super().__init__(level=logging.WARNING)
         self.buf = buf
-        self.strip_marks = strip_marks             # error channel on the strip
 
     def emit(self, record):
         try:
             self.buf.append((record.levelname, record.getMessage()))
             del self.buf[:-50]                     # keep the newest 50
-            if self.strip_marks is not None:
-                self.strip_marks.append((time.monotonic(), "err", 0))
         except Exception:                          # never let display kill logging
             pass
 
@@ -431,10 +430,17 @@ def build_config(ptt, resume_handle, voice, langs, temp=0.0, think="high",
     return types.LiveConnectConfig(**kwargs)
 
 
-def setup_logging(logpath, verbose):
-    logging.basicConfig(filename=str(logpath), filemode="w", level=logging.DEBUG,
-                        format="%(asctime)s.%(msecs)03d %(levelname)-5s %(message)s",
-                        datefmt="%H:%M:%S")
+def setup_logging(cap, verbose):
+    """Every log record → log.jsonseq (untruncated, dual-stamped). log.jsonseq IS the
+    log now — no separate text file. --verbose also mirrors to the console."""
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    root.addHandler(CaptureLogHandler(cap))
+    if verbose:
+        console = logging.StreamHandler()
+        console.setFormatter(logging.Formatter(
+            "%(asctime)s.%(msecs)03d %(levelname)-5s %(message)s", datefmt="%H:%M:%S"))
+        root.addHandler(console)
     lvl = logging.DEBUG if verbose else logging.INFO
     logging.getLogger("websockets").setLevel(lvl)
     logging.getLogger("google_genai").setLevel(lvl)
@@ -785,71 +791,24 @@ async def run():
     thoughts = "--no-thoughts" not in sys.argv  # stream the agent's reasoning (default on)
     earcons_on = "--no-earcons" not in sys.argv  # audio cues for engine state (default on)
     dev_mode = os.environ.get("DEV_MODE", "").lower() in ("dev", "1", "true")
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    diag = HERE / "diagnostics"
-    diag.mkdir(exist_ok=True)
-    setup_logging(diag / f"session_{ts}.log", "--verbose" in sys.argv)
+    ts = time.strftime("%Y%m%d-%H%M%S")     # server-run id: stamps browser tabs (?s=)
+    # ── RAW SESSION CAPTURE ──────────────────────────────────────────────────
+    # ws.jsonseq (every frame in/out, verbatim) + log.jsonseq (every log record) —
+    # dumb, complete, untruncated. All interpretation lives OFFLINE in tooling/.
+    # See capture.py for the doctrine.
+    cap = Capture(model=MODEL, langs=langs, temp=temp, think=think, voice=voice,
+                  argv=sys.argv[1:])
+    setup_logging(cap, "--verbose" in sys.argv)
+    log.info("=== session %s → %s ===", cap.id, cap.dir)
     seed_workspace()
 
-    mic_wav = wave.open(str(diag / f"session_{ts}_mic.wav"), "wb")
-    mic_wav.setnchannels(1); mic_wav.setsampwidth(2); mic_wav.setframerate(IN_RATE)
-    tutor_wav = wave.open(str(diag / f"session_{ts}_tutor.wav"), "wb")
-    tutor_wav.setnchannels(1); tutor_wav.setsampwidth(2); tutor_wav.setframerate(OUT_RATE)
-    # playback.wav = the actual send-order stream to the speaker (model post-clamp + CLIPS +
-    # earcons). tutor.wav is generation-order model-only; this tap records what we told the
-    # helper to play — incl. clips, which tutor.wav misses (the blind spot behind the
-    # unreconstructable 'weird sound'). Combine with flush events for truncation. (The
-    # helper's TRUE rendered output would need a Swift-side tap — deferred.)
-    playback_wav = wave.open(str(diag / f"session_{ts}_playback.wav"), "wb")
+    # playback.wav = the actual send-order stream to the speaker (model post-clamp
+    # + CLIPS + earcons) — the ONE audio artifact that never crosses the wire, so
+    # it can't be recovered from ws.jsonseq. Mic + model audio ARE in ws.jsonseq
+    # (base64), so no separate tutor/mic wavs. (The helper's TRUE rendered output
+    # would need a Swift-side tap — deferred.)
+    playback_wav = wave.open(str(cap.path("playback.wav")), "wb")
     playback_wav.setnchannels(1); playback_wav.setsampwidth(2); playback_wav.setframerate(OUT_RATE)
-
-    # ── THE JOURNAL ──────────────────────────────────────────────────────────
-    # One monotonic-stamped JSONL line per timeline event, so a post-mortem can
-    # reconstruct EXACTLY what crossed the engine boundary and the audio timeline,
-    # UNTRUNCATED. The bulky bytes live in the WAV/PNG files; the journal carries
-    # timing + structure + text and REFERENCES the media (tutor.wav byte offsets,
-    # screenshot paths). Everything: mic speech edges, every model-audio chunk +
-    # its scheduled play-slot, every flush, tool code + full output, thoughts,
-    # transcripts, every message in/out of the engine, errors/warnings. Building
-    # the tooling to PROCESS this is deferred until a session needs analyzing.
-    T0 = time.monotonic()
-    journal = open(diag / f"session_{ts}.jsonl", "w", buffering=1)   # line-buffered
-    _jlock = threading.Lock()                       # on_mic writes from a reader thread
-
-    def jrec(_kind, **f):
-        # fixed keys LAST so a field named "kind"/"t" can never shadow them, and
-        # a bad call can never raise past this (a crashing journal must not take
-        # down the receiver — field 2026-07-07: kind=kind collided and did exactly that)
-        try:
-            line = json.dumps({**f, "t": round(time.monotonic() - T0, 4),
-                               "kind": _kind}, ensure_ascii=False, default=str) + "\n"
-            with _jlock:
-                journal.write(line)
-        except Exception:
-            pass                                    # the journal must never crash a session
-
-    wavpos = {"tutor": 0}                           # running byte offset into tutor.wav
-
-    def write_tutor(pcm):                           # write + return this chunk's byte offset
-        off = wavpos["tutor"]
-        tutor_wav.writeframes(pcm)
-        wavpos["tutor"] += len(pcm)
-        return off
-
-    class _JournalHandler(logging.Handler):         # mirror EVERY log line into the journal
-        def emit(self, r):
-            jrec("log", level=r.levelname, msg=r.getMessage())
-    log.addHandler(_JournalHandler())
-
-    jrec("meta", session=ts, t0_wall=time.time(),
-         mic_wav=f"session_{ts}_mic.wav", tutor_wav=f"session_{ts}_tutor.wav",
-         playback_wav=f"session_{ts}_playback.wav",
-         mic_rate=IN_RATE, tutor_rate=OUT_RATE,
-         note="t = seconds since session monotonic origin; tutor.wav is "
-              "GENERATION-order model-only (offsets in model_audio/earcon map into it); "
-              "playback.wav is the SEND-order stream to the speaker (incl. clips); mic.wav "
-              "is REAL-TIME (mic_wav_start gives its origin); speaker output is "
-              "reconstructable from tutor.wav/playback.wav + play_schedule + flush events")
 
     client = genai.Client()
     loop = asyncio.get_running_loop()
@@ -860,13 +819,10 @@ async def run():
     thought_line = []                           # this turn's streamed reasoning (Layer 4)
     events = []                                 # the ONE event stream (pending delivery)
     chat_log = []                               # WARNING/ERROR lines headed for the rail
-    # the diagnostic STRIP: timestamped samples/marks drained to the browser at 4Hz
-    strip = {"mic": deque(maxlen=400), "out": deque(maxlen=1200),
-             "marks": deque(maxlen=400)}
-    log.addHandler(ChatLogHandler(chat_log, strip_marks=strip["marks"]))
-
-    def smark(kind, val=0):
-        strip["marks"].append((time.monotonic(), kind, val))
+    # the LEVEL strip: mic + speaker dBFS, drained to the browser at 4Hz. A live
+    # rough-meter only; the forensic timeline lives in ws.jsonseq/log.jsonseq.
+    strip = {"mic": deque(maxlen=400), "out": deque(maxlen=1200)}
+    log.addHandler(ChatLogHandler(chat_log))
     jobs = {}                                   # id -> job dict
     js_waiters = {}                             # id -> Future
     stats = {"mic_chunks": 0, "mic_sent": 0, "mic_blocked": 0, "rx_audio_bytes": 0,
@@ -887,7 +843,6 @@ async def run():
              "greeting_gate": True,   # mic held shut until the opening greeting's first
                                       # audio — protects the fragile pre-audio window from
                                       # noise/event interrupts (field 2026-07-07)
-             "turn_had_audio": False,   # first audio of a turn → strip 'reply' mark
              "quiet_run": 0.0,          # contiguous near-silent model audio queued (tail clamp)
              "tail_clamped_s": 0.0,     # clamped comfort-noise THIS turn → prominent-logged at turn end
              "scrub_turn": False}       # stay_silent tool: scrub ALL of this turn's audio from playback
@@ -927,11 +882,12 @@ async def run():
         if pcm is None or audio["pipe"] is None:
             return
         stats["earcons"] += 1
-        smark("earcon")
         log.info("EARCON: %s", name)
         audio["pipe"].play(pcm)
-        off = write_tutor(pcm)         # so the cue lands in the session recording too
-        jrec("earcon", name=name, wav_off=off, dur=round(len(pcm) / 2 / OUT_RATE, 3))
+        try:
+            playback_wav.writeframes(pcm)   # the cue lands in the speaker record too
+        except Exception:
+            pass
 
     # ── state broadcast: the browser renders ONLY what the server says ───────
     bc_last = {"snap": None}          # reset to None to force a resend
@@ -962,16 +918,14 @@ async def run():
         while not stop_event.is_set():
             await asyncio.sleep(0.25)
             try:
-                # drain the strip buffers to the browser
-                if strip["mic"] or strip["out"] or strip["marks"]:
+                # drain the level buffers to the browser
+                if strip["mic"] or strip["out"]:
                     payload = {"type": "strip", "now": time.monotonic(),
                                "mic": [[round(t, 3), round(db, 1)]
                                        for t, db in strip["mic"]],
                                "out": [[round(t, 3), round(db, 1), k]
-                                       for t, db, k in strip["out"]],
-                               "marks": [[round(t, 3), k, v]
-                                         for t, k, v in strip["marks"]]}
-                    strip["mic"].clear(); strip["out"].clear(); strip["marks"].clear()
+                                       for t, db, k in strip["out"]]}
+                    strip["mic"].clear(); strip["out"].clear()
                     await ws_send(payload)
                 p = audio["pipe"]
                 if (p is not None and not pipe_dead_reported
@@ -1031,29 +985,13 @@ async def run():
     # ── audio: OS-level AEC via aec_helper (experiments/09) ──────────────────
     # The helper owns both directions: playback we queue becomes the cancellation
     # reference; the mic stream on its stdout has our own audio subtracted, so it
-    # stays open while the teacher speaks (voice barge-in via server VAD).
-    mic_vad = {"started": False, "speaking": False, "last_voice": 0.0, "run0": 0.0}
-
+    # stays open while the teacher speaks (voice barge-in via the engine's VAD).
     def on_mic(chunk):                          # reader THREAD of the helper
         if stopping.is_set():
             return
-        if not mic_vad["started"]:              # anchor mic.wav frame 0 on the timeline
-            mic_vad["started"] = True
-            jrec("mic_wav_start")
-        mic_wav.writeframes(chunk)
-        t = time.monotonic()
-        db = pcm_dbfs(chunk)
-        strip["mic"].append((t, db))            # the strip IS the hearing truth now
-        # student speech edges off the (post-AEC) mic energy — approximates what the
-        # engine's VAD sees; mic.wav is the exact record if a segment needs stt.
-        if db > -40:
-            if not mic_vad["speaking"]:
-                mic_vad["speaking"] = True; mic_vad["run0"] = t
-                jrec("mic_speech_start", db=round(db, 1))
-            mic_vad["last_voice"] = t
-        elif mic_vad["speaking"] and t - mic_vad["last_voice"] > 0.6:
-            mic_vad["speaking"] = False
-            jrec("mic_speech_stop", dur=round(mic_vad["last_voice"] - mic_vad["run0"], 2))
+        # live mic level for the strip; the exact mic audio the model hears is on
+        # the wire in ws.jsonseq (the realtimeInput frames we send).
+        strip["mic"].append((time.monotonic(), pcm_dbfs(chunk)))
         loop.call_soon_threadsafe(mic_q.put_nowait, chunk)
 
     boot_input_vol = get_input_volume()
@@ -1090,12 +1028,6 @@ async def run():
                                  pcm_dbfs(pcm[i:i + step]), kind))
         dur = len(pcm) / 2 / OUT_RATE
         state["play_until"] = slot + dur
-        # scheduled-playout record: this audio is queued to START at `slot` (which
-        # may be seconds ahead of now); with the tutor.wav offset this reconstructs
-        # exactly what the speakers should emit and when.
-        jrec("play_schedule", audio_kind=kind, dur=round(dur, 3),
-             slot=round(slot - T0, 4), ahead=round(slot - now, 3),
-             play_until=round(state["play_until"] - T0, 4))
 
     def flush_playback(reason):
         """Drop all queued-but-unplayed audio. Returns seconds dropped."""
@@ -1104,11 +1036,6 @@ async def run():
         now = time.monotonic()
         dropped_s = max(0.0, state["play_until"] - now)
         state["play_until"] = now
-        smark("flush")                          # client prunes out-samples > t
-        # cut = where playout is truncated on the timeline; everything scheduled
-        # beyond this (dropped_s worth) never reaches the speakers.
-        jrec("flush", reason=reason, dropped=round(dropped_s, 3),
-             cut=round(now - T0, 4))
         log.info("PLAYBACK FLUSHED (%s), dropped %.1fs", reason, dropped_s)
         return dropped_s
 
@@ -1142,12 +1069,7 @@ async def run():
                        "code's fault; details are in the server log]")
             job["result"] = (rc, out, err, feeds)
             job["done_evt"].set()
-            # journal the FULL result now; the sync path (within grace) logs its own
-            # tool_result, so only record here if it went async (receipt won't carry it).
             await asyncio.sleep(JOB_GRACE + 0.4)
-            if not job["receipted"]:
-                jrec("tool_result", job_id=jid, sync=False, rc=rc,
-                     stdout=out, stderr=err, feeds=len(feeds))
             try:
                 head = (f"[JOB {jid} {'DONE' if rc == 0 else f'FAILED rc={rc}'}"
                         + (f" — {purpose}" if purpose else "") + "]")
@@ -1253,9 +1175,6 @@ async def run():
                 turns=types.Content(role="user", parts=parts),
                 turn_complete=engage)
             stats["events_delivered"] += len(batch)
-            smark("event", len(batch))
-            jrec("client_content_out", n=len(batch), images=nimg, engage=engage,
-                 text="\n".join(textbuf))          # FULL text into the engine
             log.info("DELIVERED to model (%d event(s), %d image(s), engage=%s): %s",
                      len(batch), nimg, engage, "\n".join(textbuf))
         except Exception:
@@ -1403,14 +1322,13 @@ async def run():
         await asyncio.sleep(0.5)
         path = await asyncio.to_thread(capture_screen)
         if path is None:
-            jrec("screenshot", ok=False, caption=caption)
+            log.warning("peek: screen snapshot FAILED (capture returned nothing)")
             enqueue("[⚠️ screen snapshot FAILED — capture returned nothing "
                     "(Screen-Recording permission?); you are blind to the screen]",
                     engage=engage)
             return None
         stats["screenshots"] += 1
-        jrec("screenshot", ok=True, caption=caption,
-             png=str(path.relative_to(WORKSPACE)))
+        log.info("peek: captured → %s (%s)", path.relative_to(WORKSPACE), caption)
         enqueue(f"[screen snapshot — {caption}]", images=[(path, caption)],
                 engage=engage)
         return path
@@ -1682,7 +1600,6 @@ async def run():
                         # macOS drops its voice-processing grip and other apps
                         # (the user's dictation tool) get the mic at full level.
                         # The Gemini connection stays alive via the heartbeat.
-                        smark("suspend_on")
                         flush_playback("⏸ suspend")
                         if audio["pipe"] is not None:
                             audio["pipe"].close()
@@ -1698,7 +1615,6 @@ async def run():
                         if audio["pipe"] is None:
                             audio["pipe"] = spawn_pipe()
                             log.info("audio helper RESPAWNED (▶)")
-                        smark("suspend_off")
                         enqueue("[student is back — session resumed]", engage=False)
                 elif kind == "shutdown":
                     if not state["shutting_down"]:
@@ -1724,8 +1640,8 @@ async def run():
 
     # ── live session tasks ───────────────────────────────────────────────────
     async def sender(session):
-        # mic_wav is written in the helper's reader thread (on_mic) — the WAV is
-        # exactly what the model COULD hear (post-AEC), sent or blocked.
+        # the mic (post-AEC) is captured on the wire in ws.jsonseq (realtimeInput
+        # frames), so what the model COULD hear is fully recorded there.
         prev_talking = False
         try:
             while True:
@@ -1774,7 +1690,6 @@ async def run():
                     data=SILENCE_100MS, mime_type=f"audio/pcm;rate={IN_RATE}"))
                 state["last_rt_send"] = time.monotonic()
                 stats["heartbeats"] += 1
-                smark("hb")
         except Exception as e:
             if is_conn_closed(e):
                 log.info("heartbeat: connection closed (%s)", e)
@@ -1786,17 +1701,10 @@ async def run():
         if sc:
             if sc.interrupted:
                 stats["interrupts"] += 1
-                # classify: was the student actually talking, or did the engine's
-                # VAD fire on echo/noise? (had_partials / mic_speaking = real signal)
-                jrec("interrupted", had_partials=bool(in_line),
-                     mic_speaking=mic_vad["speaking"],
-                     play_ahead=round(max(0.0, state["play_until"] - time.monotonic()), 3))
                 flush_playback("interrupted")
                 await earcon("barge")
             if sc.input_transcription and sc.input_transcription.text:
-                jrec("input_partial", text=sc.input_transcription.text)
                 in_line.append(sc.input_transcription.text)
-                smark("partial", len(sc.input_transcription.text.split()) or 1)
                 # LOCAL barge-in (field 2026-07-04): the server's `interrupted`
                 # only exists while the model is GENERATING. Fully-buffered turns
                 # and clips would otherwise play on, deaf to the student — the
@@ -1813,7 +1721,6 @@ async def run():
                 await ws_send({"type": "partial", "who": "you",
                                "text": "".join(in_line).strip()})
             if sc.output_transcription and sc.output_transcription.text:
-                jrec("output_partial", text=sc.output_transcription.text)
                 out_line.append(sc.output_transcription.text)
                 # (tutor line stays turn-final: its transcript would arrive
                 # seconds AHEAD of the audio — spoilers beat listening practice)
@@ -1825,10 +1732,7 @@ async def run():
                     # working, not a freeze. UNVERIFIED wire shape (Gemini-web
                     # claim) — handled defensively; a no-op if never emitted.
                     if getattr(part, "thought", False) and getattr(part, "text", None):
-                        if not state["thinking"]:
-                            state["thinking"] = True
-                            smark("think")
-                        jrec("thought", text=part.text)
+                        state["thinking"] = True
                         thought_line.append(part.text)
                         await ws_send({"type": "thought", "text": part.text})
                         continue
@@ -1838,17 +1742,13 @@ async def run():
                         if state["greeting_gate"]:      # greeting is now audible → open
                             state["greeting_gate"] = False  # the mic (barge-in normal now)
                             log.info("greeting audio started — mic opened")
-                        if not state["turn_had_audio"]:
-                            state["turn_had_audio"] = True
-                            smark("reply")
-                        off = write_tutor(data)         # record EVERYTHING generated
                         # CLAMP the comfort-noise tail (exp-13, field 2026-07-08): the model
                         # holds its turn open emitting ~-56dB vocoder room-tone (stochastic,
                         # 0.3–57s — an emergent "waiting for you" posture, not a bug). Let
                         # natural pauses through (<=TAIL_GRACE_S, so pacing/counting stay
                         # intact — exp-11) but stop QUEUEING quiet beyond that, so it never
-                        # inflates play_until into a phantom backlog. tutor.wav still records
-                        # it all (the diagnostic pipeline stays faithful). >-40 ≈ speech,
+                        # inflates play_until into a phantom backlog. The raw model audio
+                        # (incl. any clamped tail) is in ws.jsonseq regardless. >-40 ≈ speech,
                         # <-45 ≈ inaudible tail.
                         _db = pcm_dbfs(data)
                         _dur = len(data) / 2 / OUT_RATE
@@ -1863,16 +1763,10 @@ async def run():
                             state["tail_clamped_s"] += _dur
                         _scrub = state.get("scrub_turn", False)   # stay_silent tool
                         if not _clamped and not _scrub:
-                            queue_play(data)                # (logs its own play_schedule)
-                        jrec("model_audio", bytes=len(data), wav_off=off,
-                             dur=round(_dur, 3), db=round(_db, 1), clamped=_clamped,
-                             scrubbed=_scrub)
+                            queue_play(data)
                         stats["rx_audio_bytes"] += len(data)
-            if getattr(sc, "generation_complete", False):
-                jrec("generation_complete")
             if sc.turn_complete:
                 stats["turns"] += 1
-                state["turn_had_audio"] = False
                 state["thinking"] = False
                 state["quiet_run"] = 0.0
                 state["scrub_turn"] = False           # end of the silent turn (stay_silent)
@@ -1885,16 +1779,12 @@ async def run():
                     log.warning("⚠️  TAIL DETECTED: clamped %.1fs of comfort-noise tail this "
                                 "turn — the low-temp Live stall (forum 174126). temp=%s; if "
                                 "this recurs, verify temperature >= 0.5.", _tail, temp)
-                    jrec("tail_detected", clamped_s=round(_tail, 2), temp=temp)
                 you = "".join(in_line).strip()
                 tutor = "".join(out_line).strip()
-                jrec("turn_complete", you=you or None, tutor=tutor or None,
-                     think="".join(thought_line).strip() or None)
                 if thought_line:
                     log.info("THINK: %s", "".join(thought_line).strip())
                     thought_line.clear()
                 if in_line:
-                    smark("commit")
                     log.info("YOU: %s", you)
                     await ws_send({"type": "transcript", "who": "you", "text": you})
                     in_line.clear()
@@ -1906,16 +1796,13 @@ async def run():
             u = msg.session_resumption_update
             if getattr(u, "resumable", False) and getattr(u, "new_handle", None):
                 state["resume_handle"] = u.new_handle
-                jrec("session_resumption_update", resumable=True)
         if msg.usage_metadata and msg.usage_metadata.total_token_count:
             n = msg.usage_metadata.total_token_count
             if n != stats["total_tokens"]:      # the run-up to any 1007 context
                 stats["total_tokens"] = n       # overflow must be on record
-                jrec("usage", total_tokens=n)
                 log.info("tokens: total=%d", n)
         if getattr(msg, "tool_call_cancellation", None):
             ids = list(getattr(msg.tool_call_cancellation, "ids", []) or [])
-            jrec("tool_call_cancellation", ids=ids)
             log.warning("TOOL CALL CANCELLED by engine: %s", ids)
         if msg.tool_call:
             # try/finally: tool_pending stuck True would freeze model_idle() and
@@ -1932,8 +1819,6 @@ async def run():
             tl = getattr(msg.go_away, "time_left", None)
             if not state["rotating"]:
                 state["rotating"] = True
-                smark("goaway")
-                jrec("go_away", time_left=str(tl))
                 log.info("GO_AWAY (time_left=%s) — will rotate when idle", tl)
                 await earcon("link")
                 await ws_send({"type": "notice", "text": "connection rotating — resuming…"})
@@ -1942,7 +1827,6 @@ async def run():
     async def handle_tool_call(session, tool_call):
         responses = []
         for fc in tool_call.function_calls:
-            smark("call")                       # model → tool (out of engine)
             args = fc.args or {}
             if fc.name == "stay_silent":
                 # no-op turn: scrub this turn's audio so the student hears silence. Flush
@@ -1950,7 +1834,6 @@ async def run():
                 state["scrub_turn"] = True
                 flush_playback("stay_silent: scrubbing this turn's audio")
                 reason = args.get("reason", "")
-                jrec("tool_call", name="stay_silent", reason=reason)
                 log.info("TOOL stay_silent (%s) — audio scrubbed", reason)
                 resp = {"status": "done", "ok": True,
                         "note": "audio scrubbed; the student hears silence this turn"}
@@ -1958,7 +1841,6 @@ async def run():
                 await earcon("reach")           # you hear the teacher reach for a tool
                 code, purpose = args.get("code", ""), args.get("purpose", "")
                 jid = start_job(code, purpose)
-                jrec("tool_call", job_id=jid, purpose=purpose, code=code)  # FULL code
                 log.info("TOOL run_python (%s): %s", purpose, code)
                 job = jobs[jid]
                 try:
@@ -1968,10 +1850,8 @@ async def run():
                 if job["result"] is not None:   # finished within grace
                     rc, out, err, feeds = job["result"]
                     job["receipted"] = True
-                    # FULL output to the journal (untruncated); the model still gets
-                    # the capped copy via stash_job_output.
-                    jrec("tool_result", job_id=jid, sync=True, rc=rc,
-                         stdout=out, stderr=err, feeds=len(feeds))
+                    # the model gets the capped copy; the FULL output is on disk in
+                    # .jobs/ (stash_job_output) and the RECEIPT log line carries it.
                     out_m, err_m = stash_job_output(jid, out, err)
                     if rc == 0:
                         resp = {"status": "done", "ok": True, "job_id": jid,
@@ -2001,13 +1881,10 @@ async def run():
                     await earcon("async")           # went background (slow job)
             else:
                 resp = {"status": "failed", "ok": False, "error": "unknown tool"}
-            jrec("tool_response_out", **{k: resp.get(k) for k in
-                 ("job_id", "status", "ok", "error", "exit_code")})
             log.info("RECEIPT: %s", str(resp))
             responses.append(types.FunctionResponse(id=fc.id, name=fc.name,
                                                     response=resp))
         await session.send_tool_response(function_responses=responses)
-        smark("response")                       # server → model (into engine)
 
     async def rotate_when_idle():
         """After GoAway: wait (≤35s of the ~50s notice) for the teacher to finish
@@ -2096,7 +1973,7 @@ async def run():
     print(f"● babel — {MODEL} | voice: {voice} | "
           f"{'PTT' if ptt else 'hands-free'} | AEC (interrupt by voice)")
     print(f"● open http://127.0.0.1:{port}   ({gap})")
-    print(f"● workspace: {WORKSPACE}\n● diagnostics: webapp/diagnostics/session_{ts}.log\n")
+    print(f"● workspace: {WORKSPACE}\n● capture: {cap.dir}\n")
     log.info("=== start (model=%s ptt=%s voice=%s langs=%s temp=%s think=%s "
              "thoughts=%s earcons=%s dev_mode=%s) ===", MODEL, ptt,
              voice, langs, temp, think, thoughts, earcons_on, dev_mode)
@@ -2113,16 +1990,18 @@ async def run():
             state["rotating"] = False
             conn_start = time.monotonic()
             try:
+                cfg = build_config(ptt, state["resume_handle"], voice,
+                                   langs, temp, think, thoughts)
                 async with client.aio.live.connect(
-                        model=MODEL,
-                        config=build_config(ptt, state["resume_handle"], voice,
-                                            langs, temp, think, thoughts)) as session:
+                        model=MODEL, config=cfg) as session:
                     state["session"] = session
                     state["last_rt_send"] = time.monotonic()
-                    smark("conn")
-                    jrec("connect", resume=bool(state["resume_handle"]), model=MODEL,
-                         voice=voice, temp=temp, langs=langs, think=think,
-                         vad="default" if not ptt else "manual(ptt)")
+                    # tee this connection's wire into ws.jsonseq. MUST be re-applied
+                    # on every (re)connect — a rotated session has a fresh _ws.
+                    wrap_ws(session, cap)
+                    # the setup frame is sent inside connect() (before the tee) —
+                    # record its source config so meta.json is self-contained.
+                    cap.record_config(cfg)
                     log.info("live session connected (resume=%s)", bool(state["resume_handle"]))
                     if first_connect:
                         first_connect = False
@@ -2163,7 +2042,6 @@ async def run():
                                 f"import yaml; print(Path('notes.yaml').read_text()) "
                                 f"— then greet the student appropriately.]")
                         log.info("KICK: %s", kick)
-                        smark("kick"); jrec("kick", which="start", text=kick)
                         await session.send_client_content(turns=types.Content(
                             role="user", parts=[types.Part(text=kick)]), turn_complete=True)
 
@@ -2186,7 +2064,6 @@ async def run():
                                 f"Python), then pick the lesson back up gracefully — "
                                 f"briefly acknowledge the hiccup to the student.]")
                         log.info("KICK (context lost): %s", kick)
-                        smark("kick"); jrec("kick", which="context_lost", text=kick)
                         await session.send_client_content(turns=types.Content(
                             role="user", parts=[types.Part(text=kick)]), turn_complete=True)
                     while not mic_q.empty():
@@ -2273,15 +2150,23 @@ async def run():
             (WORKSPACE / ".last_session").write_text(str(time.time()))
         except OSError:
             log.exception("last_session stamp failed")
-        mic_wav.close(); tutor_wav.close(); playback_wav.close()
-        jrec("stats", **stats, tutor_wav_bytes=wavpos["tutor"])
-        jrec("end")
         try:
-            journal.close()
+            playback_wav.close()
         except Exception:
             pass
         log.info("STATS: %s", stats)
+        # auto-render the readable timeline (best-effort; the processor stays a
+        # separate, disposable tool — run before close so the .jsonseq are flushed).
+        try:
+            import subprocess
+            subprocess.run([sys.executable, str(ROOT / "tooling" / "generate_journal.py"),
+                            str(cap.dir)], timeout=30, capture_output=True)
+            log.info("report → %s/report.txt", cap.dir)
+        except Exception:
+            log.exception("report generation failed (non-fatal)")
+        cap.close()
         print(f"● done. stats: {stats}")
+        print(f"● report: {cap.dir}/report.txt")
 
 
 def main():
