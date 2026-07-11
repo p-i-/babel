@@ -293,3 +293,22 @@ def vision_pick(sheet_path, brief):
     if "```" in txt:
         txt = txt.split("```")[1].removeprefix("json").strip()
     return json.loads(txt)
+def update_board_and_keyboard(html, keys=None, snapshot=True, note="board + keyboard"):
+    """Change the stage AND repaint the keyboard in ONE call, then auto-snapshot — so the
+    board and the keyboard colours never drift out of sync (recurring bug: updating the board
+    and forgetting to recolour the keyboard). PREFER this over calling show_html + set_keys
+    separately whenever a board change should be reflected on the keyboard.
+      html:  the stage page (same as show_html).
+      keys:  {css_color: "characters", ...} = the FULL keyboard state from your notes, e.g.
+             {'#4caf50': 'аоуеі', '#e6c05a': 'пр'} (mastered green, in-progress yellow).
+             Characters you don't list are reset to default. keys=None leaves it untouched.
+      snapshot: auto-peek after (default True); the screenshot reaches your eyes shortly."""
+    p = show_html(html)
+    if keys is not None:
+        clear_keys()
+        for color, chars in keys.items():
+            if chars:
+                set_keys(chars, color)
+    if snapshot:
+        peek(note)
+    return p

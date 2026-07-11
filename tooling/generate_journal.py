@@ -24,8 +24,13 @@ import sys
 import time
 from pathlib import Path
 
-GAP_S = 1.5          # audio inter-arrival gap above this = a discontinuity, shown explicitly
-STALL_S = 4.0        # a model-audio gap this big gets a loud ⚠️  (candidate stall)
+GAP_S = 1.5          # audio inter-arrival gap above this splits a run (collapse granularity)
+STALL_MIN = 8.0      # a mid-turn model-audio gap must exceed this to count as a STALL —
+                     # below it is normal think/pacing (field 2026-07-10: 1.5s over-flagged
+                     # tool pauses + thinking). Tool-call gaps are excluded regardless.
+DEAD_S = 8.0         # you spoke + no MEANINGFUL model frame for this long = a DEAD TURN
+                     # (the live watchdog auto-kicks here). resumptionUpdate/usage/empty
+                     # serverContent do NOT count as activity — they mask a stuck engine.
 MIC_RATE, MODEL_RATE = 16000, 24000
 _HTTP = re.compile(r'\] "(GET|POST|PUT|DELETE) ')
 
@@ -131,16 +136,59 @@ def main(session_dir):
     # turnComplete is the model going silent MID-TURN — the real stall. (Field
     # 2026-07-10: without this the tool cries wolf on every between-turn pause.)
     turn_completes = []
+    tool_calls = []
     for _w, m, payload in ws:
         if payload.startswith("in "):
             try:
-                sc = json.loads(payload[3:]).get("serverContent")
-                if isinstance(sc, dict) and sc.get("turnComplete"):
-                    turn_completes.append(m)
+                o = json.loads(payload[3:])
             except Exception:
-                pass
+                continue
+            if o.get("toolCall"):
+                tool_calls.append(m)
+            sc = o.get("serverContent")
+            if isinstance(sc, dict) and sc.get("turnComplete"):
+                turn_completes.append(m)
     def tc_in(a, b):
         return any(a < t <= b for t in turn_completes)
+    def tool_in(a, b):
+        return any(a - 0.3 <= t <= b for t in tool_calls)   # a tool executing in the gap
+
+    # ── DEAD-TURN detector (mirrors the live is-dead watchdog exactly) ───────────
+    # You spoke, and the model produced NO real output for > DEAD_S. The clock resets on
+    # any meaningful frame (inputTranscription / model audio-text-thought / outputTranscription
+    # / toolCall / turnComplete / interrupted). NOT resumptionUpdate/usage/empty.
+    # owes = student spoke; it CLEARS only on a REAL reply (audio / non-thought text /
+    # outputTranscription / toolCall) — NOT on turnComplete, because an interrupted turn
+    # ends "interrupted → turnComplete" with no output and would falsely clear owes,
+    # hiding the dead turn (field 000006/000007 — same bug the live code had).
+    dead_turns = []
+    t_last_act, owes = None, False
+    for _w, m, payload in ws:
+        if not payload.startswith("in "):
+            continue
+        try:
+            o = json.loads(payload[3:])
+        except Exception:
+            continue
+        sc = o.get("serverContent") if isinstance(o.get("serverContent"), dict) else None
+        is_input = bool(sc and sc.get("inputTranscription", {}).get("text"))
+        is_tc = bool(sc and sc.get("turnComplete"))
+        is_intr = bool(sc and sc.get("interrupted"))
+        parts = (sc.get("modelTurn") or {}).get("parts", []) if sc else []
+        model_produced = bool(o.get("toolCall")) or bool(sc and (
+            sc.get("outputTranscription") or
+            any(p.get("inlineData") or (p.get("text") and not p.get("thought"))
+                for p in parts)))
+        thinking = bool(sc and any(p.get("thought") for p in parts))
+        resets = is_input or is_tc or is_intr or model_produced or thinking
+        if resets and owes and t_last_act is not None and (m - t_last_act) > DEAD_S:
+            dead_turns.append((t_last_act, m - t_last_act))
+        if is_input:
+            owes = True
+        if model_produced:
+            owes = False
+        if resets:
+            t_last_act = m
 
     events = []          # (mono, text) — the merged timeline
     def emit(mono, text):
@@ -202,16 +250,23 @@ def main(session_dir):
                     prev_end = r["last"]
                     gap = m - prev_end
                     flush_run(kind)
-                    if kind == "model" and gap >= GAP_S:   # discontinuity — never hidden
+                    if kind == "model" and gap >= GAP_S:   # a model-audio discontinuity
                         if tc_in(prev_end, m):             # turn ended in the gap → normal
                             emit(prev_end, f"— {gap:.1f}s quiet (turn done, awaiting student)")
-                        else:                              # mid-turn silence → THE stall
+                        elif tool_in(prev_end, m):         # a tool ran in the gap → not a stall
+                            emit(prev_end, f"— {gap:.1f}s pause (tool executing)")
+                        elif gap >= STALL_MIN:             # mid-turn silence beyond think/pace
                             stalls.append((prev_end, gap))
                             emit(prev_end, f"⚠️  STALL {gap:.1f}s — model went silent "
                                            f"MID-TURN (no turnComplete)")
+                        # else: sub-8s gap = normal thinking/pacing — not flagged
                 runs[kind] = {"start": m, "last": m, "pkts": 1, "secs": secs}
     for s in ("mic", "model"):
         flush_run(s)
+
+    for t, g in dead_turns:
+        emit(t, f"💀 DEAD TURN {g:.1f}s — you spoke, model produced NOTHING "
+                f"(live watchdog would auto-kick at {DEAD_S:.0f}s)")
 
     # ── render: header + merged timeline + footer ───────────────────────────────
     events.sort(key=lambda e: e[0])
@@ -223,16 +278,21 @@ def main(session_dir):
         f"   (full config → meta.json)",
         "",
     ]
+    if dead_turns:
+        out.append(f"💀 {len(dead_turns)} DEAD TURN(S) — you spoke, model went silent: " +
+                   ", ".join(f"{g:.0f}s @ {t - t0:.0f}s" for t, g in dead_turns))
     if stalls:
         out.append(f"⚠️  {len(stalls)} MID-TURN STALL(S): " +
                    ", ".join(f"{g:.1f}s @ {m - t0:.0f}s" for m, g in stalls))
+    if dead_turns or stalls:
         out.append("")
     out += [f"[{m - t0:7.2f}] {text}" for m, text in events]
     out += [
         "",
         f"── audio: model {tallies['model'][1]:.1f}s in speech "
         f"({tallies['model'][0]} pkts) · mic {tallies['mic'][1]:.1f}s "
-        f"({tallies['mic'][0]} pkts) · {len(stalls)} mid-turn stall(s) · "
+        f"({tallies['mic'][0]} pkts) · {len(stalls)} stall(s) · "
+        f"{len(dead_turns)} dead-turn(s) · "
         f"{len(shots)} screenshot(s) → snap_*.png ──",
         f"── ws frames seen: " +
         ", ".join(f"{k}={v}" for k, v in kinds.most_common()) + " ──",

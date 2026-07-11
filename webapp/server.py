@@ -59,6 +59,12 @@ TAIL_GRACE_S = 1.5             # queue up to this much CONTIGUOUS near-silent mo
                                # (natural pauses/pacing survive — exp-11) then clamp the rest
                                # (the model's stochastic room-tone tail — exp-13)
 MAX_RECONNECT = 5              # consecutive failures before we start shouting (never give up)
+BROWSER_WAIT_S = 30            # normal mode: crash if the tab doesn't attach within this
+WATCHDOG_S = 10               # startup come-to-life: re-kick if silent this long after a kick
+DEAD_TURN_S = 8               # mid-session: you spoke + no model output this long → auto-kick
+STALL_RECOVER_S = 5           # tail/held-open turn: quiet audio this long w/o turn_complete
+                              # → force a turn to recover (exp-14/15 — the ONLY lever, the
+                              # stall is intrinsic to 3.1 & not fixable by temp/prompt/config)
 HEARTBEAT_S = 30               # exp-07: idle kill at ~152s / audio gap kill at ~50s;
 SILENCE_100MS = b"\x00" * (IN_RATE // 10 * 2)   # a 30s silence pulse (~5 tok/min) prevents both
 DEFAULT_VOICE = "Sulafat"      # tutor voice
@@ -349,7 +355,6 @@ STAY_SILENT = types.FunctionDeclaration(
     }),
 )
 
-
 def helpers_reference():
     """The live single source of truth: signatures + docstrings extracted from the
     TEACHER'S OWN workspace/helpers.py (ast — never imported/executed). The prompt's
@@ -392,7 +397,11 @@ def build_config(ptt, resume_handle, voice, langs, temp=0.0, think="high",
                    "back to the lesson — the user decides when the roleplay resumes. "
                    "Operational anomalies OUTRANK the teaching goal at all times; "
                    "never paper over a glitch to keep the lesson smooth. Transparency "
-                   "of your internal state is the primary product in this mode.")
+                   "of your internal state is the primary product in this mode. "
+                   "Do NOT apologize or grovel — it is useless noise; when you err, "
+                   "state what went wrong in ONE line and fix it. When the user asks "
+                   "how you could be improved, critique your OWN system prompt and "
+                   "tooling concretely — name the section, propose the exact change.")
     in_tr = (types.AudioTranscriptionConfig(
                  language_hints=types.LanguageHints(language_codes=langs))
              if langs else types.AudioTranscriptionConfig())
@@ -606,6 +615,8 @@ def workspace_listing(max_entries=40):
         rel = p.relative_to(WORKSPACE)
         if any(part.startswith(".") for part in rel.parts):
             continue
+        if "__pycache__" in rel.parts or p.suffix == ".pyc":
+            continue          # bytecode cache is noise to the teacher
         if len(lines) >= max_entries:
             lines.append("…")
             break
@@ -815,6 +826,7 @@ async def run():
     mic_q: asyncio.Queue = asyncio.Queue()
     stopping = threading.Event()
     stop_event = asyncio.Event()
+    browser_ready = asyncio.Event()             # set once the student's tab attaches
     in_line, out_line = [], []
     thought_line = []                           # this turn's streamed reasoning (Layer 4)
     events = []                                 # the ONE event stream (pending delivery)
@@ -839,6 +851,12 @@ async def run():
              "kbd_colors": {},       # glyph -> css color (teacher-painted, ephemeral)
              "kbd_lang": pick_kbd_lang(langs),
              "browser_told": False,  # what the model last heard about browser presence
+             "kicked": False,        # first kick sent → browser events now allowed
+             "engine_alive": False,  # reset per connect; True on first model activity
+             "recovering": False,    # a recovery kick is in flight for a stuck turn
+             "t_last_activity": 0.0, # monotonic time of last MEANINGFUL inbound frame
+             "owes_response": False, # student spoke; model hasn't completed a turn since
+             "t_last_kick": 0.0,     # dead-turn watchdog cooldown
              "thinking": False,       # a `thought` part arrived; cleared on audio/turn end
              "greeting_gate": True,   # mic held shut until the opening greeting's first
                                       # audio — protects the fragile pre-audio window from
@@ -973,6 +991,9 @@ async def run():
                 await asyncio.sleep(1.0)
             except asyncio.CancelledError:
                 return
+            if not state["kicked"]:
+                return   # startup: the KICK conveys initial presence — no event.
+                         # (Emitting one here would race INTO the greeting and cancel it.)
             if present == state["browser_told"]:
                 return                         # net no change — say nothing
             state["browser_told"] = present
@@ -1531,7 +1552,8 @@ async def run():
             await state["ws"].close()
         state["ws"] = ws
         log.info("browser connected (s=%s)", s)
-        notify_browser(True)
+        browser_ready.set()                    # unblocks the startup sequence
+        notify_browser(True)                   # no-op until the first kick (see guard)
         await ws_send({"type": "status", "mode": "ptt" if ptt else "handsfree",
                        "voice": voice, "langs": langs, "boot": ts})
         await ws_send(kbd_msg())
@@ -1698,6 +1720,25 @@ async def run():
 
     async def handle_message(session, msg):
         sc = msg.server_content
+        if msg.tool_call or (sc and (sc.model_turn or sc.output_transcription
+                or sc.input_transcription or sc.turn_complete or sc.interrupted)):
+            state["engine_alive"] = True        # disarms the come-to-life watchdog
+            state["t_last_activity"] = time.monotonic()   # feeds the dead-turn watchdog
+            # NB: resumptionUpdate / usageMetadata / empty serverContent are NOT here —
+            # they flow while the engine is stuck and would mask a dead turn (field 000005).
+        # owes_response clears ONLY on a REAL reply — model audio, non-thought text,
+        # output transcription, or a tool call. NOT on turn_complete: an INTERRUPTED turn
+        # ends "interrupted → turnComplete" (API ref) carrying no output, and treating that
+        # as a reply cleared owes and disarmed the dead-turn watchdog (field 000006/000007).
+        # A bare `thought` doesn't count either — the model can think, then still go dead.
+        _parts = (sc.model_turn.parts if sc and sc.model_turn else None) or []
+        model_produced = bool(msg.tool_call) or bool(sc and (
+            (sc.output_transcription and sc.output_transcription.text) or
+            any((getattr(p, "inline_data", None) and p.inline_data.data) or
+                (getattr(p, "text", None) and not getattr(p, "thought", False))
+                for p in _parts)))
+        if model_produced:
+            state["owes_response"] = False       # a real reply landed → no longer owed
         if sc:
             if sc.interrupted:
                 stats["interrupts"] += 1
@@ -1705,6 +1746,7 @@ async def run():
                 await earcon("barge")
             if sc.input_transcription and sc.input_transcription.text:
                 in_line.append(sc.input_transcription.text)
+                state["owes_response"] = True    # you spoke → model owes a reply (dead-turn watchdog)
                 # LOCAL barge-in (field 2026-07-04): the server's `interrupted`
                 # only exists while the model is GENERATING. Fully-buffered turns
                 # and clips would otherwise play on, deaf to the student — the
@@ -1718,6 +1760,8 @@ async def run():
                             f"audio — ~{dropped_s:.1f}s of it went unheard]",
                             engage=False)
                 # live "I hear you" feedback while the student is still speaking
+                # (auxiliary USM/Chirp ASR — drifts languages, but it's what we show
+                # for now; accurate out-of-band STT is roadmapped)
                 await ws_send({"type": "partial", "who": "you",
                                "text": "".join(in_line).strip()})
             if sc.output_transcription and sc.output_transcription.text:
@@ -1765,8 +1809,20 @@ async def run():
                         if not _clamped and not _scrub:
                             queue_play(data)
                         stats["rx_audio_bytes"] += len(data)
+                        # exp-15 RECOVERY: speech is done (audio quiet) but the turn is
+                        # held open — the intrinsic 3.1 "goes dead" stall. Force a turn
+                        # to re-engage rather than wait tens of seconds for turn_complete.
+                        if (_clamped and not _scrub and not state["recovering"]
+                                and state["quiet_run"] >= STALL_RECOVER_S):
+                            state["recovering"] = True
+                            log.warning("HELD-OPEN TURN: %.1fs quiet, no turn_complete — "
+                                        "forcing a turn to recover (exp-15)", state["quiet_run"])
+                            spawn(send_kick("unstick"), "unstick")
             if sc.turn_complete:
                 stats["turns"] += 1
+                state["recovering"] = False
+                # NB: owes_response is NOT cleared here — a turn_complete can be the tail
+                # of an INTERRUPTED (empty) turn. It clears above, on real model output.
                 state["thinking"] = False
                 state["quiet_run"] = 0.0
                 state["scrub_turn"] = False           # end of the silent turn (stay_silent)
@@ -1980,6 +2036,93 @@ async def run():
 
     pump = spawn(event_pump(), "event_pump")
     broadcaster = spawn(state_broadcaster(), "state_broadcaster")
+
+    # ── the KICK: the Live model never speaks first (probed 2026-07-10, 0/6 cold
+    # connects self-initiated) — a synthetic user turn wakes it. Greeting pedagogy
+    # lives in system.md; this just conveys the session boundary + dynamic context.
+    async def send_kick(kind):
+        session = state["session"]
+        if session is None:
+            return
+        now = time.strftime("%A %Y-%m-%d %H:%M")
+        if kind == "start":
+            text = (f"[Session start. Local time: {now}. {gap}. Your workspace "
+                    f"files:\n{workspace_listing()}\nThe screen boots EMPTY (files "
+                    f"persist; the screen does not). Open the session now per your "
+                    f"instructions.]")
+        elif kind == "context_lost":
+            text = (f"[Your connection reset and your CONVERSATION memory is gone (a "
+                    f"session-lifetime limit) — your workspace is intact. Local time: "
+                    f"{now}. Your workspace files:\n{workspace_listing()}\nRe-read "
+                    f"notes.md, then pick the lesson back up gracefully — briefly "
+                    f"acknowledge the hiccup.]")
+        else:                                   # "unstick" — recover a stuck/lost turn
+            # Used by BOTH the come-to-life watchdog (no frames) and the tail-recovery
+            # (quiet audio, no turn_complete). Force a turn; the branches tell the model
+            # how to respond so a completed-but-held turn doesn't produce a spurious line.
+            text = ("[Your turn didn't complete — the channel is held open. If you were "
+                    "mid-sentence, finish it NOW. If you'd finished speaking and are just "
+                    "waiting for the student, call stay_silent. If you haven't begun the "
+                    "session yet, greet and get set up now.]")
+        log.info("KICK (%s): %s", kind, text)
+        await session.send_client_content(turns=types.Content(
+            role="user", parts=[types.Part(text=text)]), turn_complete=True)
+
+    async def come_to_life(kind):
+        # after a kick, if the engine produces NO activity for WATCHDOG_S the turn
+        # was lost (e.g. cancelled) — re-kick. Disarms the instant any model
+        # activity arrives (engine_alive). Armed ONLY when we kick (cold start /
+        # context-loss) — never on a silent resume, where waiting IS correct.
+        while not state["engine_alive"] and not stop_event.is_set():
+            await asyncio.sleep(WATCHDOG_S)
+            if state["engine_alive"] or stop_event.is_set() or state["session"] is None:
+                return
+            log.warning("engine dormant %ds after %s kick — re-kicking (unstick)", WATCHDOG_S, kind)
+            await send_kick("unstick")
+
+    async def _greet_gate_timeout():
+        await asyncio.sleep(12)                 # never lock the mic out forever
+        if state["greeting_gate"]:
+            state["greeting_gate"] = False
+            log.info("greeting gate: 12s timeout, no greeting audio — opening mic")
+
+    def tools_active():
+        return state["tool_pending"] or any(not j["task"].done() for j in jobs.values())
+
+    async def dead_turn_watchdog():
+        # THE mid-session dead turn: you spoke and the model produced NOTHING (the
+        # "goes dead" pathology, field 000005 — 74s of silence, you had to re-prod).
+        # Clock = most-recent of {last meaningful frame, last kick}; while a tool runs
+        # it can't fire. resumptionUpdate/usage/empty frames don't feed t_last_activity,
+        # so they can't mask a stuck engine (that was the 36s-late bug).
+        while not stop_event.is_set():
+            await asyncio.sleep(1.0)
+            if (state["owes_response"] and state["session"] is not None
+                    and not tools_active()):
+                clock = max(state["t_last_activity"], state["t_last_kick"])
+                if time.monotonic() - clock > DEAD_TURN_S:
+                    log.warning("DEAD TURN: you spoke, no model output for >%ds — "
+                                "auto-kicking (unstick)", DEAD_TURN_S)
+                    state["t_last_kick"] = time.monotonic()
+                    await send_kick("unstick")
+
+    spawn(dead_turn_watchdog(), "dead_turn_watchdog")
+
+    # ── STARTUP SEQUENCE (fail-fast, no graceful fallback) ────────────────────
+    # Normal mode: wait for the browser, THEN connect the engine — so there is no
+    # browser-connected event in flight to cancel the greeting. If the tab never
+    # attaches, CRASH (don't limp on blind). Headless (--no-open): connect directly.
+    if "--no-open" not in sys.argv:
+        try:
+            await asyncio.wait_for(browser_ready.wait(), timeout=BROWSER_WAIT_S)
+        except asyncio.TimeoutError:
+            if audio["pipe"] is not None:
+                audio["pipe"].close()           # release the mic device before dying
+            raise RuntimeError(
+                f"browser did not attach within {BROWSER_WAIT_S}s — aborting "
+                "(is the tab blocked? run with --no-open for headless)")
+        log.info("browser ready — connecting engine")
+
     first_connect = True
     failures = 0                # consecutive quick deaths (any cause)
     try:
@@ -2003,69 +2146,26 @@ async def run():
                     # record its source config so meta.json is self-contained.
                     cap.record_config(cfg)
                     log.info("live session connected (resume=%s)", bool(state["resume_handle"]))
+                    state["engine_alive"] = False   # reset per connect (watchdog input)
+                    state["recovering"] = False
                     if first_connect:
                         first_connect = False
-                        # WAIT FOR THE FRONT-END before greeting. The browser-connected
-                        # event, delivered ~1s after the browser attaches, otherwise
-                        # races INTO the greeting and Gemini interrupts (cancels) its own
-                        # generation — the greeting is silently killed (field 2026-07-07,
-                        # diagnosed live). So hold the KICK until the browser is up
-                        # (headless --no-open: don't wait), then mark the browser as
-                        # already-announced so its connect event is SUPPRESSED (the KICK
-                        # conveys presence) and can never interrupt the greeting.
-                        if "--no-open" not in sys.argv:
-                            t_wait = time.monotonic()
-                            while (state["ws"] is None
-                                   and time.monotonic() - t_wait < 15
-                                   and not stop_event.is_set()):
-                                await asyncio.sleep(0.1)
-                            log.info("front-end %s before KICK",
-                                     "ready" if state["ws"] is not None
-                                     else "did NOT connect within 15s — kicking anyway")
-                        browser_here = state["ws"] is not None
-                        state["browser_told"] = browser_here   # suppress the initial
-                        browser_note = (                        # [browser connected] event
-                            "" if browser_here else
-                            "NO BROWSER IS CONNECTED YET — the student can see "
-                            "NOTHING (no stage, no keyboard, no board) until one "
-                            "connects; you'll get a [browser connected] note. "
-                            "Don't refer to anything visual before then. ")
-                        kick = (f"[Session start. Local time: "
-                                f"{time.strftime('%A %Y-%m-%d %H:%M')}. {gap}. "
-                                f"Your workspace files:\n{workspace_listing()}\n"
-                                f"{browser_note}"
-                                f"The student's stage is EMPTY right now — files "
-                                f"like notes.yaml persist, but the SCREEN does not "
-                                f"survive an app restart; re-show whatever the "
-                                f"lesson needs before referring to it. "
-                                f"Read your notes FIRST — ordinary Python: "
-                                f"import yaml; print(Path('notes.yaml').read_text()) "
-                                f"— then greet the student appropriately.]")
-                        log.info("KICK: %s", kick)
-                        await session.send_client_content(turns=types.Content(
-                            role="user", parts=[types.Part(text=kick)]), turn_complete=True)
-
-                        async def _greet_gate_timeout():
-                            await asyncio.sleep(12)      # never lock the mic out forever
-                            if state["greeting_gate"]:
-                                state["greeting_gate"] = False
-                                log.info("greeting gate: 12s timeout, no greeting audio "
-                                         "— opening mic")
+                        # Browser is already attached (we awaited it before connecting),
+                        # so no browser-connected event can race the greeting. Kick now;
+                        # the watchdog re-kicks if this turn is somehow lost.
+                        await send_kick("start")
+                        state["kicked"] = True             # browser events now allowed
+                        state["browser_told"] = state["ws"] is not None
+                        spawn(come_to_life("start"), "watchdog")
                         spawn(_greet_gate_timeout(), "greet_gate")
                     elif state["lost_context"]:
                         state["lost_context"] = False
                         stats["context_losses"] += 1
-                        kick = (f"[Your connection was reset and your CONVERSATION "
-                                f"memory is gone (a session-lifetime limit) — but your "
-                                f"workspace is intact. Local time: "
-                                f"{time.strftime('%A %Y-%m-%d %H:%M')}. "
-                                f"Your workspace files:\n{workspace_listing()}\n"
-                                f"Re-read notes.yaml now (ordinary "
-                                f"Python), then pick the lesson back up gracefully — "
-                                f"briefly acknowledge the hiccup to the student.]")
-                        log.info("KICK (context lost): %s", kick)
-                        await session.send_client_content(turns=types.Content(
-                            role="user", parts=[types.Part(text=kick)]), turn_complete=True)
+                        await send_kick("context_lost")
+                        spawn(come_to_life("context_lost"), "watchdog")
+                    # else: planned resume/rotation — the model may continue on its
+                    # own (idle rotation → it waits for the student); no kick, no
+                    # watchdog, so we never pester a correctly-silent session.
                     while not mic_q.empty():
                         mic_q.get_nowait()
                     in_line.clear(); out_line.clear()
